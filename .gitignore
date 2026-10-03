@@ -1,0 +1,4 @@
+# Generated simulator outputs, toolchain and build artifacts
+out/
+__pycache__/
+*.py[cod]
