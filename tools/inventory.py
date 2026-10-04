@@ -1999,7 +1999,286 @@ def csr_instruction_evidence(source_root: Path, commit: str) -> tuple[dict[str, 
     return report, missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict, compressed: dict, csr: dict) -> dict:
+def system_instruction_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Audit system words, real privilege/PC/status transitions and wait/faults."""
+    normal = {name for name, row in definitions(source_root/'sw-sysemu/insns').items()
+              if row['source'] in ('insns/system.cpp', 'insns/zifencei.cpp') and name != 'c_ebreak'}
+    words = {0x73: 'ecall', 0x100073: 'ebreak', 0x30200073: 'mret', 0x10200073: 'sret',
+             0x10500073: 'wfi', 0x100F: 'fence_i'}
+    if normal != set(words.values()) | {'sfence_vma'}:
+        raise RuntimeError('pinned system instruction handler inventory changed')
+    # Independently specify the selected cases; do not import the device driver.
+    selected = {}
+    for mode in ('M', 'S', 'U'):
+        selected['ecall_'+mode] = ('ecall', mode, 'M', {'M': 11, 'S': 9, 'U': 8}[mode], 0, 0)
+        selected['ebreak_'+mode] = ('ebreak', mode, 'M', 3, 0, 0)
+    for target in ('M', 'S', 'U'):
+        selected['mret_to_'+target] = ('mret', 'M', target, 0, 0, 0)
+    for mode in ('S', 'U'):
+        selected['mret_denied_'+mode] = ('mret', mode, 'M', 2, 0, 0)
+    for mode in ('M', 'S'):
+        for target in ('S', 'U'):
+            selected['sret_'+mode+'_to_'+target] = ('sret', mode, target, 0, 0, 0)
+    selected.update(sret_TSR=('sret', 'S', 'M', 2, 1<<22, 0), sret_denied_U=('sret', 'U', 'M', 2, 0, 0),
+                    wfi_exclusive_M=('wfi', 'M', 'M', 0, 0, 1), wfi_exclusive_S=('wfi', 'S', 'S', 0, 0, 1),
+                    wfi_denied_U=('wfi', 'U', 'M', 2, 0, 0), wfi_TW=('wfi', 'S', 'M', 2, 1<<21, 0),
+                    fence_i_stub=('fence_i', 'M', 'M', 30, 0, 0), sfence_vma_stub=('sfence_vma', 'M', 'M', 30, 0, 0),
+                    wfi_wait=('wfi', 'M', 'M', 0, 0, 0))
+    privilege = {'M': 3, 'S': 1, 'U': 0}
+
+    def return_status(status, machine=True):
+        return ((status & 0xFFFFFFFFFFFFE777) | ((status>>7&1)<<3) | 0x80) if machine else \
+               ((status & 0xFFFFFFFFFFFFFEDD) | ((status>>5&1)<<1) | 0x20)
+
+    def trap_status(status, mode):
+        return (status & 0xFFFFFFFFFFFFE777) | (privilege[mode]<<11) | ((status>>3&1)<<7)
+
+    runs, missing = [], []
+    for case in ('primary', 'exact'):
+        directory = ROOT/'out/system'/('' if case == 'primary' else case)
+        required = ('kernel.S', 'link.ld', 'kernel.elf', 'kernel.asm', 'text.bin', 'text.os.bin', 'op.bin', 'operations.bin',
+                    'operations.json', 'elf-layout.json', 'symbols.txt', 'trace.log', 'registers.json', 'prestart.bin',
+                    'output.bin', 'expected.bin', 'commands.log', 'result.json')
+        run_name = str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required):
+            missing.append(run_name)
+            continue
+        result, layout, sites, registers = (json.loads((directory/name).read_text()) for name in
+            ('result.json', 'elf-layout.json', 'operations.json', 'registers.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case'] != case or \
+                (result['operation_count'], result['handler_count'], result['trap_count'], result['escape_count']) != (24, 7, 14, 7):
+            raise RuntimeError('incomplete system result counts')
+        if len(sites) != 24 or len(registers['operations']) != 24 or {s['name'] for s in sites} != set(selected) or {s['handler'] for s in sites} != normal:
+            raise RuntimeError('system selected sites/handlers differ')
+        elf, pre, memory = ((directory/name).read_bytes() for name in ('kernel.elf', 'prestart.bin', 'output.bin'))
+        if elf[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', elf, 18)[0] != 243:
+            raise RuntimeError('system expected RV64 little-endian ELF')
+        entry, phoff, shoff = struct.unpack_from('<3Q', elf, 24)
+        phsize, phcount, shsize, shcount, strings = struct.unpack_from('<5H', elf, 54)
+        segments = [struct.unpack_from('<II6Q', elf, phoff+i*phsize) for i in range(phcount)]
+        sections = [struct.unpack_from('<II4QII2Q', elf, shoff+i*shsize) for i in range(shcount)]
+        names = elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections = {names[s[0]:].split(b'\0', 1)[0].decode(): s for s in sections}
+        if [name for name, s in sections.items() if s[2]&4 and s[5]] != ['.text', '.text.os'] or entry != int(layout['entry'], 16):
+            raise RuntimeError('system executable sections/entry differ')
+        for section, dump in [('.text', 'text.bin'), ('.text.os', 'text.os.bin')]:
+            s = sections[section]
+            if (directory/dump).read_bytes() != elf[s[4]:s[4]+s[5]] or layout['section_dumps'][section] != dump:
+                raise RuntimeError('system executable section extraction differs')
+        if sections['.text.os'][3] != 0x8004001000:
+            raise RuntimeError('system lower-mode code outside selected OS box')
+        start, size = int(layout['monitor_address'], 16), layout['monitor_size']
+        mappings = [p[2]+start-p[3] for p in segments if p[0] == 1 and p[3] <= start and start+size <= p[3]+p[5]]
+        if start != 0x8004100000 or len(mappings) != 1 or len(pre) != size or len(memory) != size or pre != elf[mappings[0]:mappings[0]+size]:
+            raise RuntimeError('system initial monitor does not match ELF OS-box inputs/guards')
+        syms = {s[2]: int(s[0], 16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s := line.split()) == 3}
+        trace = (directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace:
+            raise RuntimeError('system incomplete execution')
+        events, current, state = [], None, {}
+        for line in trace.splitlines():
+            match = re.match(r'^(\d+): DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(([MSU])\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$', line)
+            if match:
+                current = dict(index=len(events), cycle=int(match[1]), hart=match[2], mode=match[3], pc=int(match[4], 16),
+                    word=int(match[5], 16), decoded=match[6], regs={}, memory=[], csrs=[], before=state.copy(), raw=[])
+                events.append(current)
+            if current is not None:
+                current['raw'].append(line)
+                match = re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['regs'][match[1]+match[2]] = int(match[3], 16)
+                    if match[2] == '=':
+                        state[match[1]] = int(match[3], 16)
+                match = re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['memory'].append((int(match[1]), int(match[2], 16), match[3], int(match[4], 16)))
+                match = re.search(r'\t(mstatus|mepc|sepc|mcause|mtval|excl_mode) ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['csrs'].append((match[1], match[2], int(match[3], 16)))
+                    state[match[1]] = int(match[3], 16)
+        if any(e['hart'] != 'H0 S0:N0:C0:T0' for e in events):
+            raise RuntimeError('system unexpected hart')
+        by_pc = {}
+        for e in events:
+            by_pc.setdefault(e['pc'], []).append(e)
+
+        def event(name):
+            found = by_pc.get(syms[name], [])
+            if len(found) != 1:
+                raise RuntimeError('system missing/repeated actual site '+name)
+            return found[0]
+
+        captures = {(prefix, csr): by_pc.get(syms[prefix+'_'+csr], []) for prefix in ('capture', 'escape_capture')
+                    for csr in ('mcause', 'mepc', 'mtval', 'mstatus')}
+        traps = re.findall(r'\[(H\d+ S\d+:N\d+:C\d+:T\d+)\].*Trapping to M-mode with cause 0x([0-9a-f]+) and tval 0x([0-9a-f]+)', trace)
+        returns = by_pc.get(syms['trap_return'], [])
+        expected, faults, escapes, raw_trap_index = bytearray(pre), 0, 0, 0
+        a, b = ((0xFEDCBA9889ABCDEF, 0x0123456789ABCDEF) if case == 'primary' else (0x0123456776543210, 0xFEDCBA9876543210))
+        gprs = {'x10': a, 'x11': b, 'x20': 0x5AA55AA55AA55AA5}
+
+        def audit_trap(prefix, number, offset, base, cause, pc, tval, status, continuation):
+            nonlocal raw_trap_index
+            values = (cause, pc, tval, status)
+            if struct.unpack_from('<4Q', memory, offset+base) != values or raw_trap_index >= len(traps) or \
+                    traps[raw_trap_index] != ('H0 S0:N0:C0:T0', f'{cause:x}', f'{tval:x}'):
+                raise RuntimeError('system independent trap/reference/raw log mismatch')
+            for j, (csr, value) in enumerate(zip(('mcause', 'mepc', 'mtval', 'mstatus'), values)):
+                found = captures[prefix, csr]
+                if len(found) <= number:
+                    raise RuntimeError('system fault-state capture missing')
+                read = found[number]
+                if read['regs'].get('x5=') != value or read['csrs'] != [(csr, ':', value)] or \
+                        events[read['index']+1]['memory'] != [(64, start+offset+base+8*j, '=', value)]:
+                    raise RuntimeError('system fault-state actual CSR/store event mismatch')
+            if raw_trap_index >= len(returns):
+                raise RuntimeError('system trap return missing')
+            returning = returns[raw_trap_index]
+            forced = (status & ~0x1800) | 0x1800
+            if returning['word'] != 0x30200073 or returning['mode'] != 'M' or returning['before'].get('mstatus') != forced or \
+                    returning['before'].get('mepc') != continuation or returning['csrs'] != [('mstatus', '=', return_status(forced))] or \
+                    events[returning['index']+1]['pc'] != continuation or events[returning['index']+1]['mode'] != 'M':
+                raise RuntimeError('system trap helper real MRET/PC/status/privilege mismatch')
+            raw_trap_index += 1
+            struct.pack_into('<4Q', expected, offset+base, *values)
+            return dict(mcause=cause, mepc=hex(pc), mtval=hex(tval), mstatus=hex(status))
+
+        for site, row in zip(sites, registers['operations']):
+            name, pc = site['name'], int(site['pc'], 16)
+            handler, mode, after_mode, cause, flag, exclusive = selected[name]
+            waiting = name == 'wfi_wait'
+            op = event('op_'+name)
+            offsets = [p[2]+pc-p[3] for p in segments if p[0] == 1 and p[1]&1 and p[3] <= pc and pc+4 <= p[3]+p[5]]
+            raw = bytes.fromhex(site['bytes_memory_order'])
+            word = int.from_bytes(raw, 'little')
+            decoded = 'sfence_vma' if word & 0xFE007FFF == 0x12000073 else words.get(word)
+            if len(raw) != 4 or len(offsets) != 1 or raw != elf[offsets[0]:offsets[0]+4] or offsets[0] != int(site['file_offset'], 16) or \
+                    word != op['word'] or word != int(site['word'], 16) or decoded != handler or site['handler'] != handler or \
+                    (op['mode'], site['mode'], site['after_mode'], site['cause'], site['flag'], site['exclusive'], site['waiting']) != \
+                    (mode, mode, after_mode, cause, flag, exclusive, waiting):
+                raise RuntimeError('system independent word/field/variant decoder mismatch')
+            mnemonic = handler.replace('_', '.')
+            if not op['decoded'].startswith(mnemonic) or op['memory'] or any(k.endswith('=') for k in op['regs']):
+                raise RuntimeError('system instruction disassembly/unexpected GPR or memory write')
+            if handler == 'sfence_vma' and (word>>15&31, word>>20&31, op['regs'].get('x10:'), op['regs'].get('x11:')) != (10, 11, a, b):
+                raise RuntimeError('SFENCE actual source fields/reads differ')
+            offset = syms['record_'+name]-start
+            if pre[offset:offset+256] != bytes([0xA5])*256 or struct.unpack_from('<2Q', pre, syms['input_'+name]-start) != (a, b):
+                raise RuntimeError('system deterministic input/sentinel differs')
+            for j, (suffix, reg, value) in enumerate([('a', 'x10', a), ('b', 'x11', b)]):
+                load = event('load_'+suffix+'_'+name)
+                if load['regs'].get(reg+'=') != value or load['memory'] != [(64, syms['input_'+name]+8*j, ':', value)]:
+                    raise RuntimeError('system input lacks actual load/write evidence')
+            status = op['before'].get('mstatus')
+            if status is None or any(op['before'].get(k) != v for k, v in gprs.items()) or op['before'].get('excl_mode') != exclusive:
+                raise RuntimeError('system prior state lacks actual reconstruction')
+            configured = event('configured_status_read_'+name)['regs'].get('x5=')
+            mpie, spie = (0, 1) if case == 'primary' else (1, 0)
+            mpp = privilege[after_mode] if handler == 'mret' and not cause else privilege[mode]
+            spp = int(after_mode == 'S') if handler == 'sret' and not cause else 0
+            if (configured>>11&3, configured>>8&1, configured>>7&1, configured>>5&1, configured>>3&1, configured>>1&1,
+                    configured & ((1<<21)|(1<<22))) != (mpp, spp, mpie, spie, 1-mpie, 1-spie, flag):
+                raise RuntimeError('system explicit control initialization differs')
+            for suffix, base, csr, value in [('configured_status', 128, 'mstatus', configured), ('configured_excl', 136, 'excl_mode', exclusive)]:
+                read = event(suffix+'_read_'+name)
+                if read['csrs'] != [(csr, ':', value)] or read['regs'].get('x5=') != value or \
+                        events[read['index']+1]['memory'] != [(64, start+offset+base, '=', value)]:
+                    raise RuntimeError('system configured CSR capture differs')
+                struct.pack_into('<Q', expected, offset+base, value)
+            if mode != 'M':
+                entry_op = event('enter_'+name)
+                if entry_op['mode'] != 'M' or entry_op['word'] != 0x30200073 or entry_op['before'].get('mstatus') != configured or \
+                        entry_op['csrs'] != [('mstatus', '=', return_status(configured))] or events[entry_op['index']+1]['mode'] != mode or \
+                        events[entry_op['index']+1]['pc'] != syms['begin_'+name] or status != return_status(configured):
+                    raise RuntimeError('system real lower-mode entry MRET mismatch')
+            elif status != configured:
+                raise RuntimeError('system machine status changed before operation')
+            next_pc, fault, escape, after_status = pc+4, None, None, status
+            if cause:
+                after_status = trap_status(status, mode)
+                tval = pc if handler == 'ebreak' else 0 if handler == 'ecall' else word
+                fault = audit_trap('capture', faults, offset, 64, cause, pc, tval, after_status, syms['after_'+name])
+                faults += 1
+                next_pc = syms['trap_handler']
+            elif handler in ('mret', 'sret'):
+                after_status = return_status(status, handler == 'mret')
+                target = op['before'].get('mepc' if handler == 'mret' else 'sepc')
+                target_mode = 'USHM'[status>>11&3] if handler == 'mret' else 'US'[status>>8&1]
+                if target != syms['after_'+name] or target == pc+4 or target_mode != after_mode or \
+                        op['csrs'] != [('mstatus', '=', after_status)] or '\tprv = '+after_mode not in '\n'.join(op['raw']) or \
+                        by_pc.get(syms['fallthrough_'+name]):
+                    raise RuntimeError('system return actual PC/privilege/status/fall-through mismatch')
+                next_pc = target
+            elif waiting:
+                next_pc = None
+                if op['index'] != len(events)-1 or 'Start waiting for interrupt' not in '\n'.join(op['raw']) or op['csrs']:
+                    raise RuntimeError('system terminal interrupt wait missing')
+                complete = event('complete')
+                if complete['index'] >= op['index'] or complete['memory'] != [(32, syms['completion'], '=', 0x4B4F5445)]:
+                    raise RuntimeError('system missing explicit completion before waiting')
+            elif op['csrs'] or 'Start waiting' in '\n'.join(op['raw']):
+                raise RuntimeError('exclusive WFI unexpectedly waited/changed status')
+            if next_pc is not None and (events[op['index']+1]['pc'], events[op['index']+1]['mode']) != (next_pc, 'M' if cause else after_mode):
+                raise RuntimeError('system operation actual next PC/privilege mismatch')
+            for phase, base, phase_mode in [('before', 0, mode), ('after', 24, after_mode)]:
+                if phase == 'after' and waiting:
+                    continue
+                for j, (suffix, reg, value) in enumerate([('a', 'x10', a), ('b', 'x11', b), ('x', 'x20', gprs['x20'])]):
+                    snapshot = event(phase+'_'+suffix+'_'+name)
+                    if snapshot['mode'] != phase_mode or snapshot['regs'].get(reg+':') != value or \
+                            snapshot['memory'] != [(64, start+offset+base+8*j, '=', value)]:
+                        raise RuntimeError('system actual GPR snapshot/store/privilege mismatch')
+                struct.pack_into('<3Q', expected, offset+base, a, b, gprs['x20'])
+            if after_mode in ('S', 'U') and not waiting:
+                exiting = event('escape_'+name)
+                if exiting['mode'] != after_mode or exiting['word'] != 0x73 or exiting['before']['mstatus'] != after_status or \
+                        any(exiting['before'].get(k) != v for k, v in gprs.items()):
+                    raise RuntimeError('system lower-mode real escape state differs')
+                escape = audit_trap('escape_capture', escapes, offset, 160, 9 if after_mode == 'S' else 8,
+                                    exiting['pc'], 0, trap_status(after_status, after_mode), syms['done_'+name])
+                escapes += 1
+            for phase, base, phase_mode in [('before', 48, mode), ('after', 56, after_mode)]:
+                if phase_mode != 'M' or phase == 'after' and waiting:
+                    continue
+                wanted_status = status if phase == 'before' else return_status((after_status & ~0x1800) | 0x1800) if cause else after_status
+                read, store = event(phase+'_status_read_'+name), event(phase+'_status_'+name)
+                if read['regs'].get('x5=') != wanted_status or read['csrs'] != [('mstatus', ':', wanted_status)] or \
+                        store['memory'] != [(64, start+offset+base, '=', wanted_status)]:
+                    raise RuntimeError('system independent machine-mode status snapshot mismatch')
+                struct.pack_into('<Q', expected, offset+base, wanted_status)
+            normalized_gprs = {k: hex(v) for k, v in gprs.items()}
+            if row['registers_before'] != normalized_gprs or row['registers_after'] != (None if waiting else normalized_gprs) or \
+                    row['mstatus_before'] != hex(status) or row['mstatus_after_operation'] != hex(after_status) or row['fault'] != fault or \
+                    row['escape'] != escape or row['next_pc'] != (None if waiting else hex(next_pc)) or row['waiting_observed'] != waiting or \
+                    row['hart'] != op['hart'] or row['output_memory_bytes'] != memory[offset:offset+256].hex(' ') or \
+                    any(row[k] != site[k] for k in ('name', 'mnemonic', 'pc', 'word', 'bytes_memory_order')):
+                raise RuntimeError('system normalized row differs from independent raw evidence')
+        if (faults, escapes, raw_trap_index, len(traps), len(returns)) != (14, 7, 21, 21, 21) or \
+                any(len(es) != (14 if prefix == 'capture' else 7) for (prefix, csr), es in captures.items()):
+            raise RuntimeError('system unexpected/missing fault/escape/return events')
+        struct.pack_into('<Q', expected, syms['trap_count']-start, 14)
+        struct.pack_into('<Q', expected, syms['escape_count']-start, 7)
+        struct.pack_into('<I', expected, syms['completion']-start, 0x4B4F5445)
+        operation_bytes = b''.join(bytes.fromhex(s['bytes_memory_order']) for s in sites)
+        if memory != expected or (directory/'expected.bin').read_bytes() != expected or (directory/'operations.bin').read_bytes() != operation_bytes or \
+                (directory/'op.bin').read_bytes() != operation_bytes[:4] or by_pc.get(syms['unexpected']) or \
+                by_pc.get(syms['unexpected_after_wait']) or trace.count('Start waiting for interrupt') != 1 or 'Stop waiting for interrupt' in trace:
+            raise RuntimeError('system complete guarded memory/termination/byte extraction differs')
+        runs.append(dict(run=run_name, validated_sites=24, handler_count=7, trap_count=14, escape_count=7,
+                         terminal_wait_verified=True, **{'pass': True},
+                         sha256={name: hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths = ('processor.cpp', 'processor.h', 'insns/system.cpp', 'insns/zifencei.cpp', 'insns/zicsr.cpp', 'csrs.h', 'insn.h', 'insn_util.h', 'traps.h')
+    report = dict(scope='seven system/control handlers; selected real M/S/U faults/returns, TSR/TW, exclusive WFI and terminal interrupt wait',
+        et_platform_commit=commit, verified_handlers=sorted(normal) if not missing else [], verified_runs=runs, runs_missing_evidence=missing,
+        verified_microcode_stubs=['fence_i', 'sfence_vma'] if not missing else [],
+        limitations=['debug-mode EBREAK/WFI, interrupt wake-up, pending-IRQ WFI and trap delegation untested',
+                     'terminal waiting has no after GPR snapshot; prior/unchanged state is reconstructed from actual events',
+                     'tensor/CSR engine command paths are separate from CPU instruction handler counts'],
+        source_sha256={'sw-sysemu/'+name: hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/system-instruction-inventory.json').write_text(json.dumps(report, indent=2)+'\n')
+    return report, missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict, compressed: dict, csr: dict, system: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -2028,6 +2307,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
     branch_normal = set(branches['verified_handlers'])
     compressed_normal = set(compressed['verified_handlers'])
     csr_normal = set(csr['verified_handlers'])
+    system_normal = set(system['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
@@ -2039,10 +2319,11 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                   'ordinary branch/jump execution audit' if name in branch_normal else \
                   'compressed execution/architectural fault audit' if name in compressed_normal else \
                   'CSR instruction execution/read-only fault audit' if name in csr_normal else \
+                  'system instruction execution/privilege/wait/fault audit' if name in system_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
-    report=dict(status='active source selectors plus dedicated execution/fault audits; broader CPU coverage remains incomplete',
+    report=dict(status='active CPU selectors with dedicated execution/fault audits; broader CSR engine commands remain separate',
         et_platform_commit=commit,decoded_handler_count=len(rows),defined_selected_handler_count=len(rows),missing_definitions=missing,
         verified_dedicated_handler_count=len(rows)-len(remaining),remaining_dedicated_handler_count=len(remaining),
         remaining_explicit_mcode_stub_count=sum(row['trap_stub'] for row in remaining),
@@ -2055,6 +2336,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         verified_branch_handler_count=len(branch_normal),
         verified_compressed_handler_count=len(compressed_normal),
         verified_csr_instruction_handler_count=len(csr_normal),
+        verified_system_instruction_handler_count=len(system_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
@@ -2142,7 +2424,8 @@ def main() -> int:
     branch_report, missing_branches = branch_evidence(source_root, commit)
     compressed_report, missing_compressed = compressed_evidence(source_root, commit)
     csr_report, missing_csr = csr_instruction_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report, compressed_report, csr_report)
+    system_report, missing_system = system_instruction_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report, compressed_report, csr_report, system_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -2162,6 +2445,7 @@ def main() -> int:
     print(f"ordinary branch/jump: {len(branch_report['verified_handlers'])}/8 handlers with actual next-PC/link/alias/memory evidence; {ROOT / 'out/isa/branch-inventory.json'}")
     print(f"compressed plus c.ebreak: {len(compressed_report['verified_handlers'])}/34 handlers with actual 16-bit/register/memory/path/fault evidence; {ROOT / 'out/isa/compressed-inventory.json'}")
     print(f"CSR instruction forms: {len(csr_report['verified_handlers'])}/6 handlers with actual read/write/suppression/fault evidence; {ROOT / 'out/isa/csr-instruction-inventory.json'}")
+    print(f"system/control: {len(system_report['verified_handlers'])}/7 handlers with real M/S/U PC/status/privilege/wait/fault evidence; {ROOT / 'out/isa/system-instruction-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -2188,6 +2472,8 @@ def main() -> int:
         raise RuntimeError("incomplete compressed execution/fault evidence; inspect the separate compressed inventory")
     if "--require-complete" in sys.argv and missing_csr:
         raise RuntimeError("incomplete CSR instruction execution/fault evidence; inspect the separate CSR instruction inventory")
+    if "--require-complete" in sys.argv and (missing_system or cpu_report['remaining_dedicated_handler_count']):
+        raise RuntimeError("incomplete system/control or active CPU handler execution/fault evidence; inspect the CPU inventory")
     return 0
 
 

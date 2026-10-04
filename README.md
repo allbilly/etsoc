@@ -35,6 +35,7 @@ python3 examples/base_memory.py
 python3 examples/branches.py
 python3 examples/compressed.py
 python3 examples/csr.py
+python3 examples/system.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -77,6 +78,8 @@ It runs both 36-site compressed cases: all 33 compressed handlers plus
 `c.ebreak`, including arithmetic, memory, control flow and expected faults.
 It runs both 26-site CSR cases: all six instruction forms, zero register and
 immediate rules, and six read-only faults with preserved destinations.
+It runs both 24-site system cases: all seven remaining control handlers,
+real M/S/U returns, 14 expected faults, seven lower-mode exits and terminal WFI waiting.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -135,8 +138,8 @@ Both M/U message-port permission cases must supply successful U reads,
 expected privilege/disabled-port faults and retained-message evidence.
 Both scalar-FP cases must supply all 22 implemented handlers and all six
 expected faults. Both scalar-integer cases must supply all 43 handlers and
-their selected arithmetic edge cases. This flag checks the implemented suites; the broader CPU
-inventory still has explicit gaps and is not a claim of complete base-ISA coverage.
+their selected arithmetic edge cases. This flag checks all selected active CPU
+handlers; it is not a claim of exhaustive instruction/privilege/operand coverage.
 Both ordinary scalar-memory cases must also supply all 14 handlers with actual
 access-width/address/value, register, control-state, and complete guard evidence.
 Both branch/jump cases must supply all eight handlers, both conditional paths,
@@ -145,14 +148,16 @@ Both compressed cases must supply all 34 selected handlers, two-byte encodings,
 actual register/MEM effects, both zero-branch outcomes and all three expected faults.
 Both CSR cases must supply all six instruction handlers, real CSR read/write
 events, suppressed accesses, guarded snapshots and six expected read-only faults.
+Both system cases must supply all seven handlers, real next-PC/privilege/status
+transitions, all expected faults and helper exits, and actual WFI wait evidence.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
 43 scalar-integer handlers, 14 ordinary scalar-memory handlers, eight
 branch/jump handlers, 33 compressed handlers plus `c.ebreak`, six CSR instruction
-handlers, and **seven handlers without dedicated per-operation audit coverage**.
-Those seven include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other five are `ecall`, `ebreak`, `mret`, `sret` and `wfi`.
+handlers, and seven system/control handlers. **All 353 active CPU handlers now
+have dedicated execution or expected-fault audits.** This includes two explicit
+microcode stubs (`fence.i`, `sfence.vma`) and `ecall`, `ebreak`, `mret`, `sret`, `wfi`.
 These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
@@ -162,6 +167,7 @@ The ordinary scalar-memory audit is `out/isa/base-memory-inventory.json`.
 The branch/jump audit is `out/isa/branch-inventory.json`.
 The compressed audit is `out/isa/compressed-inventory.json`.
 The CSR instruction audit is `out/isa/csr-instruction-inventory.json`.
+The system/control audit is `out/isa/system-instruction-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -634,6 +640,74 @@ Both actual cases and the independent audit passed. Their console logs and
 exit statuses are `out/csr-all-console.log`/`.exit` and
 `out/isa/csr-instruction-inventory.log`/`.exit`. Exhaustive CSR addresses,
 register aliases and privilege combinations remain outside these selected cases.
+
+### System instructions, returns and privilege
+
+`system.py` exercises all seven remaining CPU handlers at 24 sites per case.
+The primary and exact cases change the loaded GPR inputs and reverse the
+configured MPIE/MIE and SPIE/SIE bits. All source and destination GPRs are
+snapshotted from real execution. Neither control operations nor intentional
+faults may change x10, x11 or the x20 sentinel.
+
+| Instruction/path | Actual execution evidence checked |
+| --- | --- |
+| `ecall` in M/S/U | Causes 11/9/8, `mepc=PC`, `mtval=0`, correct prior privilege in MPP |
+| `ebreak` in M/S/U | Cause 3, `mepc=PC`, `mtval=PC`, unchanged GPRs |
+| `mret` in M to M/S/U | Actual status write, MIE from MPIE, MPIE=1, MPP cleared, real next privilege and jump to `mepc` |
+| `mret` in S/U | Cause 2, instruction word in `mtval`, unchanged GPRs |
+| `sret` in M/S to S/U | Actual status write, SIE from SPIE, SPIE=1, SPP cleared, real next privilege and jump to `sepc` |
+| `sret` in S with TSR, or U | Cause 2 with instruction word in `mtval` |
+| `wfi` in M/S with exclusive mode set | Instruction executes without waiting; next instruction retains privilege and state |
+| `wfi` in S with TW, or U | Cause 2 with instruction word in `mtval` |
+| `fence.i`, `sfence.vma a0,a1` | Pinned handlers raise cause 30; instruction word in `mtval`, unchanged GPRs |
+| Terminal `wfi` in M, exclusive mode zero, local interrupts disabled | Explicit completion store precedes the instruction; raw `Start waiting for interrupt`, no later instruction, normal `Finishing emulation` |
+
+The measured words are `00000073` (ECALL), `00100073` (EBREAK), `30200073`
+(MRET), `10200073` (SRET), `10500073` (WFI), `0000100f` (FENCE.I) and
+`12b50073` (`sfence.vma x10,x11`). Their selectors follow the pinned
+[`dec_system`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/processor.cpp#L718)
+and [FENCE decoder](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/processor.cpp),
+with behavior from [`system.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/system.cpp)
+and [`zifencei.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/zifencei.cpp).
+The two fence handlers do not perform their architectural synchronization
+operations in this simulator; passing those sites means observing their specified fault.
+
+The linker emits two executable sections: `.text` at M-box `0x8000001000`
+holds setup and the machine trap handler, and `.text.os` at `0x8004001000`
+holds the instruction sites and snapshots accessible in M/S/U. Data is in
+the OS box at `0x8004100000`; the initialized stack remains in the M box.
+SATP is bare, interrupts and delegation are explicitly disabled, tensor lanes
+are disabled, and relevant status/return/exclusive state is reset for every site.
+Cross-section jumps load the address and use `jr`, because the sections are
+64 MiB apart. The initial out-of-range JAL link attempt and host edit-count
+assertion are preserved under `out/isa/attempts/system-cross-section-jal/`;
+neither failed attempt invoked SysEmu.
+
+Successful returns jump past a fall-through guard. The next raw instruction
+must be at the linked target in its actual new privilege. Lower-mode GPR
+snapshots execute in that privilege, followed by a real ECALL to return to the
+M-box setup. There are seven such helper exits per case. The handler saves
+four fault CSRs and explicitly returns to M for the next site; unexpected
+traps record diagnostics and fail. Each case has exactly 14 selected-operation
+faults, seven helper exits and 21 checked trap-handler returns.
+
+Full `mstatus` is reconstructed from actual CSR reads/writes and return trace
+events, including when S/U cannot read it directly. Before/after machine-mode
+CSR snapshots and both trap/exit snapshots independently confirm that state.
+Each 256-byte record includes GPR snapshots, available status snapshots, fault
+and helper-exit records, configuration reads and untouched guards. Unavailable
+S/U `mstatus` snapshot slots and terminal WFI after-GPR slots retain their
+sentinels; the report explicitly marks the terminal after-GPR state absent.
+The independent audit checks the complete guarded monitor, entry/target PCs,
+actual mode changes, trap state and return state, both executable-section
+dumps, and the terminal wait. The cycle watchdog and 90-second host timeout apply.
+
+Both real cases and their independent audit passed. Actual commands/results
+and zero exits are in `out/system-all-console.log`/`.exit` and
+`out/isa/system-instruction-inventory.log`/`.exit`. Debug-mode behavior,
+interrupt wake-up, pending-IRQ WFI and trap delegation are untested. This
+finishes dedicated coverage of the selected CPU handler inventory; dynamic
+CSR engine commands remain separate, and no tensor-engine execution is claimed.
 
 ### Packed memory and atomics
 
@@ -1233,7 +1307,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
-Together with scalar integer, ordinary scalar memory, branches, compressed and CSR instructions, the current default driver has 52 device runs
+Together with scalar integer, ordinary scalar memory, branches, compressed, CSR and system instructions, the current default driver has 54 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
@@ -1322,8 +1396,8 @@ Both CSR instruction cases and their independent audit have now passed: all
 The real command `python3 examples/csr.py` and zero exit are preserved in
 `out/csr-all-console.log` and its matching `.exit` file. The independent audit
 is `out/isa/csr-instruction-inventory.log` with a zero `.exit` file. Dedicated
-CPU coverage is now 346/353 handlers, leaving seven. The expanded default
-comparison requires 52 fresh device runs; that full fresh comparison remains
+That checkpoint had CPU coverage of 346/353 handlers, leaving seven. Its default
+comparison required 52 fresh device runs; that full fresh comparison was
 outstanding. Previous reports and comparison evidence are archived under
 `out/isa/checkpoints/before-csr/` and
 `out/compare/checkpoints/compressed-completed/`.
@@ -1335,6 +1409,26 @@ checkpoint audit passed across those 51 ELF evidence sets and one fresh patched
 run, 530 artifact/upstream hashes and 24 Python syntax checks; its log and zero
 exit are `out/isa/csr-instruction-checkpoint-audit.log` and the matching `.exit`
 file. Saved-artifact mode does not claim 52 newly executed programs.
+Both system instruction cases and their independent audit have now passed:
+24 sites per case, seven handlers, 14 selected-operation faults and seven
+lower-mode helper exits, actual M/S/U return state and terminal WFI waiting.
+The real command `python3 examples/system.py` and zero exit are in
+`out/system-all-console.log` and the matching `.exit` file. The independent
+audit is `out/isa/system-instruction-inventory.log` with a zero `.exit` file.
+All 353 selected CPU handlers now have dedicated execution/fault evidence;
+the default comparison requires 54 fresh device runs, and a fresh complete
+run of that expanded driver remains outstanding. Previous reports and
+comparison evidence are archived in `out/isa/checkpoints/before-system/`
+and `out/compare/checkpoints/csr-completed/`.
+The expanded `python3 tools/compare.py --reuse` passed: 53 saved example
+execution sets were independently audited and the ADD-to-MUL patched ELF was
+freshly executed once. Its log and zero exit are
+`out/compare/system-reuse-console.log` and the matching `.exit` file. The
+additional checkpoint audit passed across those 53 ELF evidence sets plus
+one fresh patched run, 567 artifact/upstream hashes and 25 Python syntax
+checks. Its log and zero exit are `out/isa/system-instruction-checkpoint-audit.log`
+and the matching `.exit` file. Saved-artifact mode does not claim 54 newly
+executed programs.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1386,6 +1480,18 @@ Generated outputs are ignored by Git and remain in `out/`:
   independently decoded and checked against real CSR/register/MEM/fault events,
   prior state reconstructed from actual writes, complete guarded outputs,
   34 artifact hashes and five pinned upstream source hashes.
+- `out/system/`: both real 24-site programs, M/S/U instruction/register/status
+  traces, `.text` and `.text.os` dumps, expected faults and lower-mode exits,
+  terminal WFI waiting, guarded memory and completion/command/exit evidence.
+- `out/isa/system-instruction-inventory.json`: all seven instruction handlers
+  independently decoded and checked against real PC/privilege/status/GPR/MEM/
+  trap/return/wait evidence; 36 artifact hashes and nine upstream source hashes.
+- `out/isa/system-instruction-completion-audit.json`: comparison checkpoint of
+  all 353 CPU handlers, 53 saved execution sets plus one fresh patched run,
+  567 artifact/upstream hashes, 27 repository source hashes, actual executable
+  sections, complete guarded memory/fault/exit/completion checks and the
+  independently verified single-byte ELF patch. The corresponding
+  `out/isa/system-instruction-checkpoint-audit.py` reproduces the artifact audit.
 - `out/isa/csr-instruction-completion-audit.json`: comparison checkpoint of 51
   saved execution sets plus one fresh patched run, 530 artifact/upstream hashes,
   26 repository source hashes, actual executable-section dumps, complete guarded
