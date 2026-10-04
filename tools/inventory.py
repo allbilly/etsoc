@@ -972,6 +972,230 @@ def synchronization_peer_evidence(source_root: Path, commit: str) -> tuple[dict[
     return report, missing
 
 
+def scalar_fp_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Audit all scalar FP handlers using real trace groups and guarded memory."""
+    handlers = {name: row for name, row in definitions(source_root / 'sw-sysemu/insns').items()
+                if row['source'] == 'insns/float.cpp'}
+    normal = {row['mnemonic'] for row in handlers.values() if not row['trap_stub']}
+    faults = {row['mnemonic'] for row in handlers.values() if row['trap_stub']}
+    if (len(normal), len(faults)) != (22, 6):
+        raise RuntimeError('pinned scalar FP handler inventory changed')
+    runs, missing = [], []
+    for case in ('primary', 'exact'):
+        directory = ROOT / 'out/scalar-fp' / ('' if case == 'primary' else case)
+        required = ('result.json','elf-layout.json','kernel.elf','kernel.S','trace.log','output.bin',
+                    'prestart.bin','expected.bin','registers.json','operations.json','text.bin','symbols.txt','commands.log')
+        run_name = str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required):
+            missing.append(run_name)
+            continue
+        result, layout, sites, registers = (json.loads((directory/name).read_text()) for name in
+                                            ('result.json','elf-layout.json','operations.json','registers.json'))
+        if not result.get('pass') or (result['operation_count'],result['nontrapping_handler_count'],result['trap_stub_count'],result['trap_count']) != (31,22,6,6):
+            raise RuntimeError('incomplete scalar FP result counts')
+        if len(sites)!=31 or len(registers['operations'])!=31:
+            raise RuntimeError('incomplete scalar FP operation/register records')
+        if {s['mnemonic'] for s in sites if not s['cause']}!=normal or {s['mnemonic'] for s in sites if s['cause']}!=faults:
+            raise RuntimeError('scalar FP source handlers lack complete operation coverage')
+        elf, pre, memory = ((directory/name).read_bytes() for name in ('kernel.elf','prestart.bin','output.bin'))
+        if elf[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',elf,18)[0]!=243:
+            raise RuntimeError('scalar FP ELF architecture mismatch')
+        entry, phoff, shoff = struct.unpack_from('<3Q',elf,24)
+        phsize, phcount, shsize, shcount, strings = struct.unpack_from('<5H',elf,54)
+        segments = [struct.unpack_from('<II6Q',elf,phoff+i*phsize) for i in range(phcount)]
+        sections = [struct.unpack_from('<II4QII2Q',elf,shoff+i*shsize) for i in range(shcount)]
+        names = elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections = {names[s[0]:].split(b'\0',1)[0].decode():s for s in sections}
+        if [name for name,s in sections.items() if s[2]&4 and s[5]]!=['.text'] or int(layout['entry'],16)!=entry:
+            raise RuntimeError('scalar FP executable section/entry mismatch')
+        text = sections['.text']
+        if (directory/'text.bin').read_bytes()!=elf[text[4]:text[4]+text[5]]:
+            raise RuntimeError('scalar FP text bytes differ from ELF section')
+        start, size = int(layout['monitor_address'],16),layout['monitor_size']
+        mappings = [p[2]+start-p[3] for p in segments if p[0]==1 and p[3]<=start and start+size<=p[3]+p[5]]
+        if len(mappings)!=1 or len(pre)!=size or len(memory)!=size or pre!=elf[mappings[0]:mappings[0]+size]:
+            raise RuntimeError('scalar FP complete pre-execution monitor differs from ELF input bytes')
+        syms = {s[2]:int(s[0],16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s:=line.split())==3}
+        trace = (directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace:
+            raise RuntimeError('scalar FP lacks normal simulator completion')
+        events, current = [], None
+        for line in trace.splitlines():
+            match = re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$',line)
+            if match:
+                current = dict(hart=match[1],pc=int(match[2],16),word=int(match[3],16),decoded=match[4],regs={})
+                events.append(current)
+            elif current is not None:
+                match = re.search(r'\b(f\d+) ([=:]) \{([^}]+)\}',line)
+                if match:
+                    words = tuple(int(x,16) for x in re.findall(r'\d+:0x([0-9a-f]{8})',match[3]))
+                    if len(words)!=8: raise RuntimeError('scalar FP incomplete actual vector register event')
+                    current['regs'][match[1]+match[2]]=words
+                match = re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['regs'][match[1]+match[2]]=int(match[3],16)
+        if any(e['hart']!='H0 S0:N0:C0:T0' for e in events):
+            raise RuntimeError('scalar FP unexpected executing hart')
+        def event(label):
+            matches = [e for e in events if e['pc']==syms[label]]
+            if len(matches)!=1: raise RuntimeError(f'scalar FP missing/repeated actual site: {label}')
+            return matches[0]
+        state, before = {}, {}
+        pcs = {int(s['pc'],16) for s in sites}
+        for e in events:
+            if e['pc'] in pcs: before[e['pc']]=dict(state)
+            for key, value in e['regs'].items():
+                if key.endswith('='): state[key[:-1]]=value
+        expected, trap_index = bytearray(pre), 0
+        actual_traps = re.findall(r'\[(H\d+ S\d+:N\d+:C\d+:T\d+)\].*Trapping to M-mode with cause 0x([0-9a-f]+) and tval 0x([0-9a-f]+)',trace)
+        csr_events = {csr:[e for e in events if e['pc']==syms['capture_'+csr]] for csr in ('mcause','mepc','mtval','mstatus')}
+        for site,row in zip(sites,registers['operations']):
+            name, mnemonic, pc = site['name'],site['mnemonic'],int(site['pc'],16)
+            op = event('op_'+name)
+            offsets = [p[2]+pc-p[3] for p in segments if p[0]==1 and p[1]&1 and p[3]<=pc and pc+4<=p[3]+p[5]]
+            raw = bytes.fromhex(site['bytes_memory_order'])
+            if len(offsets)!=1 or raw!=elf[offsets[0]:offsets[0]+4] or offsets[0]!=int(site['file_offset'],16):
+                raise RuntimeError('scalar FP operation PC/file-offset bytes mismatch')
+            word = int.from_bytes(raw,'little')
+            if word!=int(site['word'],16) or word!=op['word'] or not op['decoded'].startswith(mnemonic):
+                raise RuntimeError('scalar FP assembled bytes differ from actual execution')
+            if word&127 not in (0x53,0x43,0x47,0x4B,0x4F) or word>>7&31!=20:
+                raise RuntimeError('scalar FP operation opcode/destination mismatch')
+            source = before[pc]
+            for reg in ('f10','f11','f13'):
+                address = syms[f'input_{name}_{reg}']-start
+                loaded = struct.unpack_from('<8I',pre,address)
+                if source.get(reg)!=loaded or event(f'load_{name}_{reg}')['regs'].get(reg+'=')!=loaded:
+                    raise RuntimeError('scalar FP input lacks actual full-register load evidence')
+                if row['inputs_before'][reg]['raw_u32']!=[f'0x{x:08x}' for x in loaded]:
+                    raise RuntimeError('normalized scalar FP source state differs from actual events')
+            aw,bw,cw = (source[r][0] for r in ('f10','f11','f13'))
+            a,b,c = (struct.unpack('<f',struct.pack('<I',x))[0] for x in (aw,bw,cw))
+            fbefore, fafter = (event(f'{phase}_{name}')['regs'].get('f20:') for phase in ('before','after'))
+            xbefore, xafter = (event(f'x_{phase}_{name}')['regs'].get('x20:') for phase in ('before','after'))
+            masks = tuple(event(f'mask_{phase}_{name}')['regs'].get('x5=') for phase in ('before','after'))
+            controls = tuple(event(f'fcsr_{phase}_{name}')['regs'].get('x5=') for phase in ('before','after'))
+            if fbefore!=(0xA5A5A5A5,)*8 or source.get('f20')!=fbefore or xbefore!=0x5AA55AA55AA55AA5 or source.get('x20')!=xbefore:
+                raise RuntimeError('scalar FP pre-operation destination not actually seeded')
+            fp_result, int_result, flags = None, None, 0
+            arithmetic = {'fadd.s':a+b,'fsub.s':a-b,'fmul.s':a*b,'fmadd.s':a*b+c,
+                          'fmsub.s':a*b-c,'fnmadd.s':-(a*b+c),'fnmsub.s':-a*b+c,'fmin.s':min(a,b),'fmax.s':max(a,b)}
+            if not site['cause']:
+                if mnemonic in arithmetic: fp_result=struct.unpack('<I',struct.pack('<f',arithmetic[mnemonic]))[0]
+                elif mnemonic.startswith('fsgnj'):
+                    sign = bw&0x80000000 if mnemonic=='fsgnj.s' else (~bw)&0x80000000 if mnemonic=='fsgnjn.s' else (aw^bw)&0x80000000
+                    fp_result=(aw&0x7FFFFFFF)|sign
+                elif mnemonic in ('fcvt.w.s','fcvt.wu.s'):
+                    rounded = int(a) if word>>12&7==1 else round(a)
+                    flags=int(rounded!=a)
+                    int_result=rounded&0xFFFFFFFF
+                    if int_result&0x80000000: int_result|=0xFFFFFFFF00000000
+                elif mnemonic in ('fcvt.s.w','fcvt.s.wu'):
+                    integer=source['x5']&0xFFFFFFFF
+                    if mnemonic=='fcvt.s.w' and integer&0x80000000: integer-=1<<32
+                    fp_result=struct.unpack('<I',struct.pack('<f',float(integer)))[0]
+                    flags=int(struct.unpack('<f',struct.pack('<I',fp_result))[0]!=integer)
+                elif mnemonic=='fmv.w.x': fp_result=source['x5']&0xFFFFFFFF
+                elif mnemonic=='fmv.x.w': int_result=aw|(0xFFFFFFFF00000000 if aw&0x80000000 else 0)
+                elif mnemonic in ('feq.s','fle.s','flt.s'): int_result=int(a==b if mnemonic=='feq.s' else a<=b if mnemonic=='fle.s' else a<b)
+                elif mnemonic=='fclass.s':
+                    exponent,fraction,sign=aw>>23&255,aw&0x7FFFFF,aw>>31
+                    code=(8 if fraction and not fraction&0x400000 else 9 if fraction else 0 if sign else 7) if exponent==255 else (3 if sign else 4) if exponent==0 and fraction==0 else (2 if sign else 5) if exponent==0 else (1 if sign else 6)
+                    int_result=1<<code
+                else: raise RuntimeError('scalar FP reference does not cover handler')
+            wanted_fp=(fp_result,0,0,0,0,0,0,0) if fp_result is not None else fbefore
+            wanted_x=int_result if int_result is not None else xbefore
+            wanted_mask=0 if name=='mask_zero_fadd_s' else 255
+            if (fafter,xafter,masks,controls)!=(wanted_fp,wanted_x,(wanted_mask,wanted_mask),(0,flags)):
+                raise RuntimeError('scalar FP actual snapshots disagree with independent reference')
+            if fp_result is not None and op['regs'].get('f20=')!=fafter or int_result is not None and op['regs'].get('x20=')!=xafter:
+                raise RuntimeError('scalar FP result lacks matching actual write event')
+            offset=syms['record_'+name]-start
+            if pre[offset:offset+192]!=bytes([0xA5])*192: raise RuntimeError('scalar FP record lacks pre-execution sentinel')
+            wanted=bytearray([0xA5]*192)
+            struct.pack_into('<16I6Q',wanted,0,*fbefore,*fafter,xbefore,xafter,*masks,*controls)
+            if site['cause']:
+                fault=struct.unpack_from('<4Q',memory,offset+112)
+                if fault[:3]!=(30,pc,word) or fault[3]>>11&3!=3 or 'f20=' in op['regs'] or 'x20=' in op['regs']:
+                    raise RuntimeError('scalar FP unexpected fault/destination mutation')
+                if actual_traps[trap_index]!=('H0 S0:N0:C0:T0','1e',f'{word:x}'):
+                    raise RuntimeError('scalar FP fault snapshot differs from raw trap event')
+                for csr,value in zip(csr_events,fault):
+                    if csr_events[csr][trap_index]['regs'].get('x5=')!=value: raise RuntimeError('scalar FP trap CSR read mismatch')
+                struct.pack_into('<4Q',wanted,112,*fault)
+                trap_index+=1
+            if row['f20_before']['raw_u32']!=[f'0x{x:08x}' for x in fbefore] or row['f20_after']['raw_u32']!=[f'0x{x:08x}' for x in fafter]:
+                raise RuntimeError('scalar FP normalized destination state differs from real register reads')
+            if any(int(row[key],16)!=value for key,value in [('x20_before',xbefore),('x20_after',xafter),('mask_before',masks[0]),('mask_after',masks[1]),('fcsr_before',controls[0]),('fcsr_after',controls[1])]):
+                raise RuntimeError('scalar FP normalized integer/control state differs from real reads')
+            expected[offset:offset+192]=wanted
+        if trap_index!=6 or len(actual_traps)!=6 or any(len(es)!=6 for es in csr_events.values()):
+            raise RuntimeError('scalar FP unexpected/missing fault count')
+        struct.pack_into('<Q',expected,syms['trap_count']-start,6)
+        struct.pack_into('<I',expected,syms['completion']-start,0x4B4F5445)
+        if memory!=expected or (directory/'expected.bin').read_bytes()!=expected or not event('park')['decoded'].startswith('wfi'):
+            raise RuntimeError('scalar FP whole guarded monitor/termination mismatch')
+        runs.append(dict(run=run_name,validated_sites=31,normal_handler_count=22,trap_stub_count=6,**{'pass':True},
+            sha256={name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths=['processor.cpp','insns/float.cpp','insns/packed_loadstore.cpp','insn_util.h','fpu/f32_mulSub.c','fpu/f32_subMulAdd.c','fpu/f32_subMulSub.c']
+    report=dict(scope='scalar FP actual execution, complete register-write reconstruction and device snapshots; separate from packed ET extensions',
+        et_platform_commit=commit,verified_normal_handlers=sorted(normal) if not missing else [],verified_fault_stubs=sorted(faults) if not missing else [],
+        verified_runs=runs,runs_missing_evidence=missing,limitations=['selected exactly representable inputs and specific RNE/RTZ rounding cases; exhaustive IEEE edge/exception coverage not claimed'],
+        source_sha256={'sw-sysemu/'+name:hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/scalar-fp-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report, missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict) -> dict:
+    """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
+    path = source_root / 'sw-sysemu/processor.cpp'
+    source = path.read_text()
+    handlers = definitions(source_root / 'sw-sysemu/insns')
+    selectors, all_selectors, decoded_by = {}, set(), {}
+    for function in re.findall(r'static\s+insn_exec_funct_t\s+(dec_\w+)\s*\(',source):
+        body = function_body(source,rf'static\s+insn_exec_funct_t\s+{function}\s*\(')
+        body = re.sub(r'/\*.*?\*/|//[^\n]*','',body,flags=re.S)
+        all_selectors.update(re.findall(r'\binsn_(\w+)',body))
+        # The pinned CPU decoder has two literal #if 0 branches with #else.
+        # Other conditional compilation would need an explicit build-aware audit.
+        body = re.sub(r'#if\s+0\b.*?#else\b(.*?)#endif\b',r'\1',body,flags=re.S)
+        if re.search(r'^\s*#\s*(?:if|else|elif|endif)',body,re.M):
+            raise RuntimeError('CPU decoder conditional compilation needs inspection')
+        names = sorted(set(re.findall(r'\binsn_(\w+)',body))-{'reserved','illegal','exec_funct_t'})
+        selectors[function]=names
+        for name in names: decoded_by.setdefault(name,[]).append(function)
+    missing = sorted(set(decoded_by)-set(handlers))
+    if missing: raise RuntimeError(f'active CPU decoder references absent handler definitions: {missing}')
+    extension_covered = {op['handler'] for op in extension['operations']
+                         if op['execution_evidence'] or op['mnemonic'] in extension['trap_evidence']}
+    scalar_normal = set(scalar['verified_normal_handlers'])
+    scalar_faults = set(scalar['verified_fault_stubs'])
+    rows = []
+    for name in sorted(decoded_by):
+        row = handlers[name]
+        covered = 'ET extension execution/fault audit' if 'insn_'+name in extension_covered else \
+                  'scalar FP execution audit' if row['mnemonic'] in scalar_normal else \
+                  'scalar FP fault audit' if row['mnemonic'] in scalar_faults else \
+                  'not independently audited by a dedicated operation suite'
+        rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
+    remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
+    report=dict(status='active source selectors plus dedicated execution/fault audits; broader CPU coverage remains incomplete',
+        et_platform_commit=commit,decoded_handler_count=len(rows),defined_selected_handler_count=len(rows),missing_definitions=missing,
+        verified_dedicated_handler_count=len(rows)-len(remaining),remaining_dedicated_handler_count=len(remaining),
+        remaining_explicit_mcode_stub_count=sum(row['trap_stub'] for row in remaining),
+        remaining_other_handler_count=sum(not row['trap_stub'] for row in remaining),
+        et_extension_nontrapping_checkpoint_count=extension['verified_execution_handler_count'],
+        et_extension_fault_checkpoint_count=extension['verified_trap_stub_count'],
+        verified_scalar_fp_handler_count=len(scalar_normal),verified_scalar_fp_fault_count=len(scalar_faults),
+        decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
+        source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
+        limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
+                'Remaining non-microcode handlers include architectural traps and reserved/illegal compressed handlers.',
+                'Incidental base instructions in startup are not counted as dedicated operation audits.',
+                'Dynamic CSR engine commands are separate; tensor command paths remain unverified.'])
+    (ROOT/'out/isa/full-cpu-source-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report
+
+
 def main() -> int:
     if sys.argv[1:] not in ([], ["--require-complete"]):
         raise SystemExit("usage: python3 tools/inventory.py [--require-complete]")
@@ -1043,6 +1267,8 @@ def main() -> int:
     port_report, missing_ports = message_port_evidence(source_root, commit)
     privilege_report, missing_privilege = message_port_privilege_evidence(source_root, commit)
     peer_report, missing_peers = synchronization_peer_evidence(source_root, commit)
+    scalar_fp_report, missing_scalar_fp = scalar_fp_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1056,6 +1282,8 @@ def main() -> int:
     print(f"separate message-port CSR coverage: {port_report['verified_csr_count']}/12; {ROOT / 'out/isa/message-port-inventory.json'}")
     print(f"message-port real M/U permission cases: {len(privilege_report['verified_runs'])}/2; {ROOT / 'out/isa/message-port-privilege-inventory.json'}")
     print(f"peer synchronization cases with audited T0/T1 routing/block/wake/overflow: {len(peer_report['verified_runs'])}/4; {ROOT / 'out/isa/synchronization-peer-inventory.json'}")
+    print(f"scalar FP: {len(scalar_fp_report['verified_normal_handlers'])}/22 implemented handlers and {len(scalar_fp_report['verified_fault_stubs'])}/6 fault stubs; {ROOT / 'out/isa/scalar-fp-inventory.json'}")
+    print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
         raise RuntimeError("incomplete ET extension execution/fault evidence; inspect the inventory gaps")
@@ -1069,6 +1297,8 @@ def main() -> int:
         raise RuntimeError("incomplete message-port M/U permission evidence; inspect the separate privilege inventory")
     if "--require-complete" in sys.argv and missing_peers:
         raise RuntimeError("incomplete peer synchronization execution evidence; inspect the separate peer inventory")
+    if "--require-complete" in sys.argv and missing_scalar_fp:
+        raise RuntimeError("incomplete scalar FP execution/fault evidence; inspect the separate scalar FP inventory")
     return 0
 
 

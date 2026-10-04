@@ -29,6 +29,7 @@ python3 examples/sub.py
 python3 examples/gemm.py
 python3 examples/packed_int.py
 python3 examples/packed_fp.py
+python3 examples/scalar_fp.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -59,6 +60,8 @@ It reruns four peer-synchronization cases for T0/T1 FCC routing, block/wake,
 wrong-thread isolation, credit overflow and ordered FLB arrivals.
 It also runs two message-port permission diagnostics that enter real U mode
 and check access, fault state and unchanged destinations on all four ports.
+It also runs both scalar-FP cases: 22 implemented handlers, six cause-30
+microcode stubs, and additional mask/rounding checks.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -110,18 +113,20 @@ All four peer-synchronization cases must supply real FCC restart, wrong-counter
 or wrong-thread isolation, overflow and ordered FLB evidence.
 Both M/U message-port permission cases must supply successful U reads,
 expected privilege/disabled-port faults and retained-message evidence.
-Source inspection also finds base RISC-V handlers outside the ET extension
-inventory. The current source-only report in
-`out/isa/full-cpu-source-inventory.json` excludes literal `#if 0` blocks and
-identifies 353 active decoder-selected handlers: the 213 ET extension handlers
-above and 140 base-instruction handlers without dedicated audit coverage.
-Those 140 comprise 132 nontrapping handlers and eight explicit microcode stubs.
-Ordinary startup executes some base instructions; this count requires
-dedicated per-operation evidence. Scalar FP contributes 22 nontrapping
-handlers and six fault stubs to that remainder. Its source-only review is in
-`out/isa/scalar-fp-source-review.json`; a dedicated scalar-FP experiment has
-not been implemented or executed yet. Dynamic CSR command identities remain
-separate from this instruction count.
+Both scalar-FP cases must supply all 22 implemented handlers and all six
+expected faults. This flag checks the implemented suites; the broader CPU
+inventory still has explicit gaps and is not a claim of complete base-ISA coverage.
+`out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
+excludes literal `#if 0` branches, and ties selectors to the separate execution
+audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
+and **112 handlers without dedicated per-operation audit coverage**.
+Those 112 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other 110 include ordinary base instructions, architectural trap handlers,
+and reserved/illegal compressed handlers. These are handler counts, not a count
+of distinct encodings or exhaustive test cases. Ordinary startup executes some
+base instructions; incidental execution does not establish dedicated coverage.
+The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
+Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
 
@@ -340,6 +345,44 @@ register writes against the source's sign handling. Registers that an
 instruction does not expose in the trace are recorded as uncaptured (`null`).
 Decoded nonfinite FP values use the strings `nan`, `+inf`, and `-inf` so the
 reports remain valid JSON; the raw 32-bit words preserve sign and NaN payloads.
+
+### Scalar floating-point coverage
+
+`scalar_fp.py` runs 31 labeled sites in each of two deterministic cases.
+It covers all 28 handlers in the pinned
+[`insns/float.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/float.cpp):
+22 implemented arithmetic/FMA, min/max, conversion, sign, move, comparison,
+and classification handlers, plus six explicit microcode stubs. The stubs are
+scalar divide, square root, and all four signed/unsigned 64-bit FP conversions.
+They raise cause 30 and leave f20/x20 unchanged; no arithmetic is substituted.
+
+Each site loads f10/f11/f13 with one scalar and seven distinct nonzero upper
+lanes, seeds f20 and x20, and captures both destinations, M0, and FCSR before
+and after. In this implementation, scalar FP writes lane 0 and clears lanes
+1–7 through `WRITE_FD_REG` in
+[`insn_util.h`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insn_util.h).
+The actual register-write event and an unmasked `fsq2` snapshot must agree
+in all eight lanes. Scalar integer results preserve the seeded FP destination.
+An additional `fadd.s` with M0=0 confirms that scalar arithmetic ignores M0;
+both explicit mask readbacks remain zero while lane 0 changes and upper lanes clear.
+
+RNE conversions check ties and FCSR NX. The extra RTZ conversion distinguishes
+`3.5 -> 3` from RNE `3.5 -> 4`; unsigned `0xffffffff -> FP32` rounds to
+`0x4f800000` and sets NX. `fmv.x.w` checks sign extension of `0x80000001`.
+`fnmadd.s` and `fnmsub.s` use the same pinned sign-handling helpers as packed
+FMA and produce `-(a*b+c)` and `-(a*b)+c`, respectively.
+
+The 192-byte device records include unchanged guards, complete FP destination
+lanes, scalar destinations, M0/FCSR readbacks, and actual mcause/mepc/mtval/mstatus
+for each fault. Whole monitor memory must equal the reference and leave inputs,
+guards, and the unexpected-trap record untouched. Source-register state is
+reconstructed from complete actual H0 register-write events and checked against
+the real vector loads; it is not filled from Python's reference values.
+The independent inventory parser repeats the ELF/PT_LOAD, raw register,
+reference, control-state, fault, and whole-memory checks. Normal completion and
+one final `wfi` are required; the 20,000-cycle watchdog and 90-second simulator
+timeout fail incomplete execution. Exhaustive IEEE edge/exception coverage is
+not claimed for these selected inputs.
 
 ### Packed memory and atomics
 
@@ -891,6 +934,7 @@ MUL: [10, 40, 90, 160, 250, 360, 490, 640]
 SUB: [-9, -18, -27, -36, -45, -54, -63, -72]
 GEMM C[0,:]: [204, 408, 612, 816, 1020, 1224, 1428, 1632]
 PACKED FP: 38/38 operation sites pass in both primary and exact cases
+SCALAR FP: 31/31 sites per case; all 22 implemented handlers and 6 cause-30 stubs pass
 PACKED INTEGER: 41/41 sites pass in both primary and exact cases
 PACKED MEMORY: 33/33 sites pass in both primary and exact cases
 PACKED ATOMIC: 22/22 sites pass in primary, exact, and alias cases
@@ -932,6 +976,16 @@ a profile of its real trace prefix are preserved in
 180 MiB across four cases; its combined host limit is now 1200 seconds.
 Each simulator invocation retains its 90-second timeout and cycle watchdog.
 The retry is not yet a passing full-comparison checkpoint.
+Both scalar-FP cases have passed independently, with all 31 sites and complete
+register/control/fault/memory evidence checked by a second parser. The current
+`tools/compare.py` adds those two executions (42 device runs per complete run);
+that expanded driver has not yet completed a full comparison. The live 40-run
+driver was launched before this addition; its exact source is preserved under
+`out/compare/checkpoints/message-port-privilege-source/` at commit `2f71f6b`.
+The actual repository command `python3 examples/scalar_fp.py` and its exit zero
+are saved in `out/scalar-fp-all-console.log` and the matching `.exit` file.
+`out/isa/scalar-fp-inventory.log` records the independent audit; its `.exit`
+file must be zero before treating this checkpoint as verified.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -951,6 +1005,16 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/packed-fp/`: generated 38-site packed-FP kernel, per-operation bytes
   and disassembly, raw simulator traces, register-state JSON, and output-memory
   dumps for both deterministic cases.
+- `out/scalar-fp/`: both actual 31-site scalar-FP programs, ELF/PT_LOAD layouts,
+  instruction bytes and decoded words, raw traces, complete destination and
+  reconstructed source registers, mask/FCSR/trap CSR reads, prestart memory,
+  actual/expected guarded memory, and command logs.
+- `out/isa/scalar-fp-inventory.json`: independently checked scalar-FP ELF,
+  register events, references, six cause-30 faults, full memory, pinned source
+  hashes, and both sets of artifact hashes.
+- `out/isa/full-cpu-source-inventory.json`: active CPU decoder selectors with
+  dedicated audit coverage and explicit remaining handlers; broader coverage
+  is incomplete even when the implemented-suite gate passes.
 - `out/packed-int/`: 30 vector operations and 11 mask-operation sites,
   per-PC instruction encodings, trace register writes, masks, counts, and
   output-memory evidence for both deterministic cases.

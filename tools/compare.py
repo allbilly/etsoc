@@ -177,7 +177,8 @@ def main() -> int:
                    ROOT / "examples" / "scalar_memory.py", ROOT / "examples" / "graphics.py",
                    ROOT / "examples" / "trap_stubs.py", ROOT / "examples" / "cache_control.py",
                    ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
-                   ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py"):
+                   ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py",
+                   ROOT / "examples" / "scalar_fp.py"):
         # Four peer cases audit every event in roughly 180 MiB of raw traces.
         # Allow their host validation to finish; each SysEmu invocation retains
         # its own 90-second timeout and cycle watchdog.
@@ -261,6 +262,12 @@ def main() -> int:
                                                       "--require-complete"], 600)
     add_example.require(inventory_run, "audit complete nontrapping ET extension coverage")
     inventory = json.loads((ROOT / "out" / "isa" / "instruction-inventory.json").read_text())
+    scalar_fp_results = [json.loads((ROOT / "out/scalar-fp" / suffix / "result.json").read_text())
+                         for suffix in ("", "exact")]
+    if any(not result['pass'] or (result['operation_count'],result['nontrapping_handler_count'],result['trap_stub_count'],result['trap_count']) != (31,22,6,6)
+           for result in scalar_fp_results):
+        raise RuntimeError('scalar FP primary/exact execution, register or fault checks failed')
+    cpu_inventory = json.loads((ROOT / "out/isa/full-cpu-source-inventory.json").read_text())
 
     add_root, mul_root, sub_root = (ROOT / "out" / name for name in ("add", "mul", "sub"))
     add_layout = json.loads((add_root / "elf-layout.json").read_text())
@@ -468,6 +475,11 @@ def main() -> int:
         "packed_float": {"instruction_count": packed_fp["operation_count"],
                          "primary_pass": packed_fp["pass"], "exact_pass": packed_fp_exact["pass"],
                          "operations": [row["name"] for row in packed_fp["output_actual"]]},
+        "scalar_float": {"instruction_count": 31, "implemented_handler_count": 22, "fault_stub_count": 6,
+                         "cases": {result['case']: result['pass'] for result in scalar_fp_results}},
+        "cpu_handler_coverage": {key: cpu_inventory[key] for key in
+            ('decoded_handler_count','verified_dedicated_handler_count','remaining_dedicated_handler_count',
+             'remaining_other_handler_count','remaining_explicit_mcode_stub_count')},
         "packed_memory": {"instruction_count": 33,
                           "cases": {result["case"]: result["pass"] for result in memory_results}},
         "packed_atomic": {"instruction_count": 22,
@@ -522,6 +534,7 @@ def main() -> int:
     print(f"GEMM {gemm_result['shape']} via {gemm_result['fma_count']} {gemm_result['device_instruction']} instructions: PASS")
     print(f"packed integer: {packed_int['instruction_count']} ops in primary/exact cases: PASS")
     print(f"packed floating-point: {packed_fp['operation_count']} sites in primary/exact cases: PASS")
+    print('scalar floating-point: 31 sites per case, 22 implemented handlers and 6 cause-30 stubs: PASS')
     print("packed memory: 33 sites in primary/exact cases: PASS")
     print("packed atomic: 22 sites in primary/exact/alias cases: PASS")
     print("scalar memory: 45 sites in primary/exact cases: PASS")
