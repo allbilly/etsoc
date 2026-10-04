@@ -1145,7 +1145,153 @@ def scalar_fp_evidence(source_root: Path, commit: str) -> tuple[dict[str, object
     return report, missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict) -> dict:
+def scalar_integer_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Audit scalar integer encodings, actual operands/results and guarded memory."""
+    normal = {row['mnemonic'] for name,row in definitions(source_root/'sw-sysemu/insns').items()
+              if row['source'] in ('insns/arith.cpp','insns/muldiv.cpp') and name!='reserved'}
+    if len(normal)!=43: raise RuntimeError('pinned scalar integer handler inventory changed')
+    def sign(x,n):
+        x &= (1<<n)-1
+        return x-(1<<n) if x>>(n-1) else x
+    def decoded_reference(word,a,b,pc):
+        opcode,f3,f7=word&127,word>>12&7,word>>25
+        narrow=opcode in (0x1B,0x3B); width=32 if narrow else 64
+        a &= (1<<width)-1; b &= (1<<width)-1
+        if opcode in (0x37,0x17):
+            name='lui' if opcode==0x37 else 'auipc'
+            return name,(sign(word&0xFFFFF000,32)+(pc if opcode==0x17 else 0))&((1<<64)-1)
+        if opcode in (0x13,0x1B):
+            name={0:'addi',1:'slli',2:'slti',3:'sltiu',4:'xori',5:'srai' if word>>30&1 else 'srli',6:'ori',7:'andi'}[f3]
+            if narrow and f3 not in (0,1,5): raise RuntimeError('unexpected scalar word immediate encoding')
+            b=(word>>20)&(width-1) if f3 in (1,5) else sign(word>>20,12)
+            if f3 in (1,5) and word>>(25 if narrow else 26) != (0x20 if narrow else 0x10) * int(name=='srai'):
+                raise RuntimeError('integer shift immediate encoding mismatch')
+        elif opcode in (0x33,0x3B):
+            table = {0:('add','sll','slt','sltu','xor','srl','or','and'),
+                     1:('mul','mulh','mulhsu','mulhu','div','divu','rem','remu'),
+                     0x20:('sub',None,None,None,None,'sra',None,None)}
+            if f7 not in table or table[f7][f3] is None: raise RuntimeError('integer register encoding mismatch')
+            name=table[f7][f3]
+            if narrow and (f7==0 and f3 not in (0,1,5) or f7==1 and f3 not in (0,4,5,6,7)):
+                raise RuntimeError('unexpected scalar word register encoding')
+        else: raise RuntimeError('unexpected scalar integer opcode')
+        operation=name[:-1] if name.endswith('i') else name
+        if operation=='add': result=a+b
+        elif operation=='sub': result=a-b
+        elif operation=='and': result=a&b
+        elif operation=='or': result=a|b
+        elif operation=='xor': result=a^b
+        elif operation=='sll': result=a<<(b&(width-1))
+        elif operation=='srl': result=a>>(b&(width-1))
+        elif operation=='sra': result=sign(a,width)>>(b&(width-1))
+        elif operation=='slt': result=int(sign(a,width)<(b if name=='slti' else sign(b,width)))
+        elif operation=='sltu' or name=='sltiu': result=int(a<(b&((1<<width)-1)))
+        elif operation=='mul': result=a*b
+        elif operation=='mulh': result=(sign(a,64)*sign(b,64))>>64
+        elif operation=='mulhsu': result=(sign(a,64)*b)>>64
+        elif operation=='mulhu': result=(a*b)>>64
+        elif operation in ('div','divu','rem','remu'):
+            aa,bb=(sign(a,width),sign(b,width)) if operation in ('div','rem') else (a,b)
+            if bb==0: result=-1 if operation.startswith('div') else aa
+            else:
+                q=abs(aa)//abs(bb)*(-1 if (aa<0)!=(bb<0) else 1)
+                result=q if operation.startswith('div') else aa-q*bb
+        else: raise RuntimeError('missing independent scalar integer reference')
+        return name+('w' if narrow else ''),(sign(result,32) if narrow else result)&((1<<64)-1)
+    runs,missing=[],[]
+    for case in ('primary','exact'):
+        directory=ROOT/'out/scalar-integer'/('' if case=='primary' else case)
+        required=('result.json','elf-layout.json','kernel.elf','kernel.S','trace.log','output.bin','prestart.bin',
+                  'expected.bin','registers.json','operations.json','text.bin','symbols.txt','commands.log')
+        run_name=str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required): missing.append(run_name); continue
+        result,layout,sites,registers=(json.loads((directory/name).read_text()) for name in
+                                     ('result.json','elf-layout.json','operations.json','registers.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case']!=case or (result['operation_count'],result['handler_count'],result['trap_count'])!=(61,43,0):
+            raise RuntimeError('incomplete scalar integer result counts')
+        if len(sites)!=61 or len(registers['operations'])!=61 or {s['mnemonic'] for s in sites}!=normal:
+            raise RuntimeError('scalar integer source handlers lack full selected-site coverage')
+        variants={v:sum(s['variant']==v for s in sites) for v in {s['variant'] for s in sites}}
+        if variants!={'ordinary':43,'divide by zero':8,'minimum signed value divided by -1':4,'register shift count masks high bits':6}:
+            raise RuntimeError('integer edge-case coverage changed')
+        elf,pre,memory=((directory/name).read_bytes() for name in ('kernel.elf','prestart.bin','output.bin'))
+        if elf[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',elf,18)[0]!=243: raise RuntimeError('integer ELF architecture mismatch')
+        entry,phoff,shoff=struct.unpack_from('<3Q',elf,24)
+        phsize,phcount,shsize,shcount,strings=struct.unpack_from('<5H',elf,54)
+        segments=[struct.unpack_from('<II6Q',elf,phoff+i*phsize) for i in range(phcount)]
+        sections=[struct.unpack_from('<II4QII2Q',elf,shoff+i*shsize) for i in range(shcount)]
+        names=elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections={names[s[0]:].split(b'\0',1)[0].decode():s for s in sections}
+        if [name for name,s in sections.items() if s[2]&4 and s[5]]!=['.text'] or entry!=int(layout['entry'],16): raise RuntimeError('integer entry/section mismatch')
+        text=sections['.text']
+        if (directory/'text.bin').read_bytes()!=elf[text[4]:text[4]+text[5]]: raise RuntimeError('integer text dump mismatch')
+        start,size=int(layout['monitor_address'],16),layout['monitor_size']
+        mappings=[p[2]+start-p[3] for p in segments if p[0]==1 and p[3]<=start and start+size<=p[3]+p[5]]
+        if len(mappings)!=1 or len(pre)!=size or len(memory)!=size or pre!=elf[mappings[0]:mappings[0]+size]: raise RuntimeError('integer prestart input/guard bytes differ from linked ELF')
+        syms={s[2]:int(s[0],16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s:=line.split())==3}
+        trace=(directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace or re.search(r'\b(?:trap|exception)\b',trace,re.I): raise RuntimeError('integer incomplete/faulting execution')
+        events,current=[],None
+        for line in trace.splitlines():
+            match=re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$',line)
+            if match:
+                current=dict(hart=match[1],pc=int(match[2],16),word=int(match[3],16),decoded=match[4],regs={},memory=[]); events.append(current)
+            elif current is not None:
+                match=re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['regs'][match[1]+match[2]]=int(match[3],16)
+                match=re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['memory'].append((int(match[1]),int(match[2],16),match[3],int(match[4],16)))
+        if any(e['hart']!='H0 S0:N0:C0:T0' for e in events): raise RuntimeError('integer unexpected hart')
+        def event(name):
+            matches=[e for e in events if e['pc']==syms[name]]
+            if len(matches)!=1: raise RuntimeError('integer missing/repeated actual site: '+name)
+            return matches[0]
+        expected=bytearray(pre)
+        for site,row in zip(sites,registers['operations']):
+            name,pc=site['name'],int(site['pc'],16); op=event('op_'+name)
+            offsets=[p[2]+pc-p[3] for p in segments if p[0]==1 and p[1]&1 and p[3]<=pc and pc+4<=p[3]+p[5]]
+            raw=bytes.fromhex(site['bytes_memory_order']); word=int.from_bytes(raw,'little')
+            if len(offsets)!=1 or raw!=elf[offsets[0]:offsets[0]+4] or offsets[0]!=int(site['file_offset'],16) or word!=int(site['word'],16) or word!=op['word']:
+                raise RuntimeError('integer operation PC/file bytes differ from actual execution')
+            if word>>7&31!=20: raise RuntimeError('integer destination register changed')
+            inputs=struct.unpack_from('<2Q',pre,syms['input_'+name]-start)
+            for j,reg in enumerate(('x10','x11')):
+                load=event(('load_a_' if j==0 else 'load_b_')+name)
+                if load['regs'].get(reg+'=')!=inputs[j] or load['memory']!=[(64,syms['input_'+name]+8*j,':',inputs[j])]: raise RuntimeError('integer input lacks actual register/memory-load evidence')
+            decoded,answer=decoded_reference(word,*inputs,pc)
+            if decoded!=site['mnemonic'] or not op['decoded'].startswith(decoded): raise RuntimeError('integer encoding field decoder mismatch')
+            if word&127 not in (0x37,0x17) and (word>>15&31!=10 or op['regs'].get('x10:')!=inputs[0]): raise RuntimeError('integer source A field/read mismatch')
+            if word&127 in (0x33,0x3B) and (word>>20&31!=11 or op['regs'].get('x11:')!=inputs[1]): raise RuntimeError('integer source B field/read mismatch')
+            if any(row[key]!=site[key] for key in ('name','mnemonic','pc','word','bytes_memory_order')) or row['hart']!=op['hart']:
+                raise RuntimeError('integer normalized operation identity differs from real site')
+            wanted=(*inputs,0x5AA55AA55AA55AA5,*inputs,answer)
+            offset=syms['record_'+name]-start
+            if pre[offset:offset+128]!=bytes([0xA5])*128: raise RuntimeError('integer pre-execution record sentinel missing')
+            actual=[]
+            for phase in ('before','after'):
+                for suffix,reg in (('a','x10'),('b','x11'),('x','x20')):
+                    snapshot=event(phase+'_'+suffix+'_'+name)
+                    actual.append(snapshot['regs'].get(reg+':'))
+                    j=len(actual)-1
+                    if snapshot['memory']!=[(64,start+offset+8*j,'=',wanted[j])]: raise RuntimeError('integer actual snapshot store differs from reference')
+            if tuple(actual)!=wanted or op['regs'].get('x20=')!=answer: raise RuntimeError('integer result/reference/raw write mismatch')
+            for key,value in zip(('x10_before','x11_before','x20_before','x10_after','x11_after','x20_after'),wanted):
+                if int(row[key],16)!=value: raise RuntimeError('integer normalized register state differs from actual reads')
+            expected[offset:offset+48]=struct.pack('<6Q',*wanted)
+        struct.pack_into('<I',expected,syms['completion']-start,0x4B4F5445)
+        if memory!=expected or (directory/'expected.bin').read_bytes()!=expected or not event('park')['decoded'].startswith('wfi'): raise RuntimeError('integer complete guarded memory/termination mismatch')
+        runs.append(dict(run=run_name,validated_sites=61,handler_count=43,variants=variants,**{'pass':True},
+            sha256={name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths=('processor.cpp','insns/arith.cpp','insns/muldiv.cpp','insn_util.h','insn.h')
+    report=dict(scope='scalar integer actual instruction encodings, register/memory events and selected arithmetic edge cases; separate from packed ET instructions',
+        et_platform_commit=commit,verified_handlers=sorted(normal) if not missing else [],verified_runs=runs,runs_missing_evidence=missing,
+        limitations=['selected normal, zero-divisor, signed-overflow and overshift cases; exhaustive operands/aliases and SysEmu software hints not claimed'],
+        source_sha256={'sw-sysemu/'+name:hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/scalar-integer-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report,missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -1169,12 +1315,14 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                          if op['execution_evidence'] or op['mnemonic'] in extension['trap_evidence']}
     scalar_normal = set(scalar['verified_normal_handlers'])
     scalar_faults = set(scalar['verified_fault_stubs'])
+    integer_normal = set(integer['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
         covered = 'ET extension execution/fault audit' if 'insn_'+name in extension_covered else \
                   'scalar FP execution audit' if row['mnemonic'] in scalar_normal else \
                   'scalar FP fault audit' if row['mnemonic'] in scalar_faults else \
+                  'scalar integer execution audit' if row['mnemonic'] in integer_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
@@ -1186,6 +1334,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         et_extension_nontrapping_checkpoint_count=extension['verified_execution_handler_count'],
         et_extension_fault_checkpoint_count=extension['verified_trap_stub_count'],
         verified_scalar_fp_handler_count=len(scalar_normal),verified_scalar_fp_fault_count=len(scalar_faults),
+        verified_scalar_integer_handler_count=len(integer_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
@@ -1268,7 +1417,8 @@ def main() -> int:
     privilege_report, missing_privilege = message_port_privilege_evidence(source_root, commit)
     peer_report, missing_peers = synchronization_peer_evidence(source_root, commit)
     scalar_fp_report, missing_scalar_fp = scalar_fp_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report)
+    integer_report, missing_integer = scalar_integer_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1283,6 +1433,7 @@ def main() -> int:
     print(f"message-port real M/U permission cases: {len(privilege_report['verified_runs'])}/2; {ROOT / 'out/isa/message-port-privilege-inventory.json'}")
     print(f"peer synchronization cases with audited T0/T1 routing/block/wake/overflow: {len(peer_report['verified_runs'])}/4; {ROOT / 'out/isa/synchronization-peer-inventory.json'}")
     print(f"scalar FP: {len(scalar_fp_report['verified_normal_handlers'])}/22 implemented handlers and {len(scalar_fp_report['verified_fault_stubs'])}/6 fault stubs; {ROOT / 'out/isa/scalar-fp-inventory.json'}")
+    print(f"scalar integer: {len(integer_report['verified_handlers'])}/43 handlers with actual encoding/register/memory evidence; {ROOT / 'out/isa/scalar-integer-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -1299,6 +1450,8 @@ def main() -> int:
         raise RuntimeError("incomplete peer synchronization execution evidence; inspect the separate peer inventory")
     if "--require-complete" in sys.argv and missing_scalar_fp:
         raise RuntimeError("incomplete scalar FP execution/fault evidence; inspect the separate scalar FP inventory")
+    if "--require-complete" in sys.argv and missing_integer:
+        raise RuntimeError("incomplete scalar integer execution/register evidence; inspect the separate integer inventory")
     return 0
 
 

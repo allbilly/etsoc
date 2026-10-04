@@ -164,12 +164,17 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--reuse"]):
+        raise SystemExit("usage: python3 tools/compare.py [--reuse]")
+    reuse = sys.argv[1:] == ["--reuse"]
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "comparison.json").unlink(missing_ok=True)
     patched_dir = OUT / "patched"
     patched_dir.mkdir(parents=True, exist_ok=True)
     commands = OUT / "commands.log"
-    commands.write_text("")
+    commands.write_text("EXAMPLE_EXECUTION_MODE: " +
+                       ("reuse saved real execution artifacts; independently audit them; freshly run patched ELF\n" if reuse else
+                        "run all examples; independently audit them; freshly run patched ELF\n"))
     for script in (ROOT / "examples" / "add.py", ROOT / "examples" / "mul.py",
                    ROOT / "examples" / "sub.py", ROOT / "examples" / "gemm.py",
                    ROOT / "examples" / "packed_int.py", ROOT / "examples" / "packed_fp.py",
@@ -178,7 +183,9 @@ def main() -> int:
                    ROOT / "examples" / "trap_stubs.py", ROOT / "examples" / "cache_control.py",
                    ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
                    ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py",
-                   ROOT / "examples" / "scalar_fp.py"):
+                   ROOT / "examples" / "scalar_fp.py", ROOT / "examples" / "scalar_integer.py"):
+        if reuse:
+            continue
         # Four peer cases audit every event in roughly 180 MiB of raw traces.
         # Allow their host validation to finish; each SysEmu invocation retains
         # its own 90-second timeout and cycle watchdog.
@@ -258,8 +265,10 @@ def main() -> int:
                                   ("expected traps", trap_results, 9), ("cache control", cache_results, 37)):
         if any(not result["pass"] or result["operation_count"] != count for result in results):
             raise RuntimeError(f"{suite} case validation or per-PC execution checks failed")
+    # The raw peer evidence contains about 180 MiB of trace data. This is a
+    # host audit deadline; per-device 90-second timeouts remain unchanged.
     inventory_run = add_example.run_logged(commands, [sys.executable, str(ROOT / "tools" / "inventory.py"),
-                                                      "--require-complete"], 600)
+                                                      "--require-complete"], 1200)
     add_example.require(inventory_run, "audit complete nontrapping ET extension coverage")
     inventory = json.loads((ROOT / "out" / "isa" / "instruction-inventory.json").read_text())
     scalar_fp_results = [json.loads((ROOT / "out/scalar-fp" / suffix / "result.json").read_text())
@@ -268,6 +277,17 @@ def main() -> int:
            for result in scalar_fp_results):
         raise RuntimeError('scalar FP primary/exact execution, register or fault checks failed')
     cpu_inventory = json.loads((ROOT / "out/isa/full-cpu-source-inventory.json").read_text())
+    evidence_reports = [inventory, *[json.loads((ROOT / "out/isa" / filename).read_text()) for filename in
+        ('cache-csr-inventory.json','synchronization-inventory.json','message-port-inventory.json',
+         'synchronization-peer-inventory.json','message-port-privilege-inventory.json',
+         'scalar-fp-inventory.json','scalar-integer-inventory.json')]]
+    example_runs = {run['run'] for evidence in evidence_reports for run in evidence['verified_runs']}
+    example_runs.update(run['run'] for rows in inventory['trap_evidence'].values() for run in rows)
+    integer_results = [json.loads((ROOT / "out/scalar-integer" / suffix / "result.json").read_text())
+                       for suffix in ("", "exact")]
+    if any(not result['pass'] or (result['operation_count'],result['handler_count'],result['trap_count']) != (61,43,0)
+           for result in integer_results):
+        raise RuntimeError('scalar integer primary/exact execution, register or guard checks failed')
 
     add_root, mul_root, sub_root = (ROOT / "out" / name for name in ("add", "mul", "sub"))
     add_layout = json.loads((add_root / "elf-layout.json").read_text())
@@ -448,6 +468,9 @@ def main() -> int:
     (OUT / "elementwise-operations.json").write_text(json.dumps(elementwise, indent=2) + "\n")
 
     report = {
+        "example_execution_mode": "saved real execution artifacts" if reuse else "fresh example executions",
+        "example_artifact_count": len(example_runs), "example_runs": sorted(example_runs),
+        "fresh_device_execution_count": 1 if reuse else len(example_runs) + 1,
         "platform_commit": commit, "simulator_decoder": "sw-sysemu/processor.cpp dec_custom3",
         "add": {"pc": add_layout["operation_pc"], "bytes_memory_order": op_add.hex(" "),
                 "word": f"0x{word_add:08x}", "fields": decoder_args},
@@ -477,6 +500,8 @@ def main() -> int:
                          "operations": [row["name"] for row in packed_fp["output_actual"]]},
         "scalar_float": {"instruction_count": 31, "implemented_handler_count": 22, "fault_stub_count": 6,
                          "cases": {result['case']: result['pass'] for result in scalar_fp_results}},
+        "scalar_integer": {"instruction_count": 61, "handler_count": 43,
+                           "cases": {result['case']: result['pass'] for result in integer_results}},
         "cpu_handler_coverage": {key: cpu_inventory[key] for key in
             ('decoded_handler_count','verified_dedicated_handler_count','remaining_dedicated_handler_count',
              'remaining_other_handler_count','remaining_explicit_mcode_stub_count')},
@@ -519,6 +544,8 @@ def main() -> int:
                                "runs_missing_evidence": inventory["runs_missing_evidence"]},
     }
     (OUT / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("Comparison mode: " + ("independently audited saved example executions + one fresh patched-ELF run" if reuse else
+                                 "fresh example executions + fresh patched-ELF run"))
     print("\n=== kernel.S diff ===")
     print(source_diff or "(no source difference)", end="")
     print("\n=== disassembly diff ===")
@@ -535,6 +562,7 @@ def main() -> int:
     print(f"packed integer: {packed_int['instruction_count']} ops in primary/exact cases: PASS")
     print(f"packed floating-point: {packed_fp['operation_count']} sites in primary/exact cases: PASS")
     print('scalar floating-point: 31 sites per case, 22 implemented handlers and 6 cause-30 stubs: PASS')
+    print('scalar integer: 61 sites per case, 43 handlers with zero-divisor/overflow/overshift cases: PASS')
     print("packed memory: 33 sites in primary/exact cases: PASS")
     print("packed atomic: 22 sites in primary/exact/alias cases: PASS")
     print("scalar memory: 45 sites in primary/exact cases: PASS")

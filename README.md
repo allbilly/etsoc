@@ -30,6 +30,7 @@ python3 examples/gemm.py
 python3 examples/packed_int.py
 python3 examples/packed_fp.py
 python3 examples/scalar_fp.py
+python3 examples/scalar_integer.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -62,9 +63,16 @@ It also runs two message-port permission diagnostics that enter real U mode
 and check access, fault state and unchanged destinations on all four ports.
 It also runs both scalar-FP cases: 22 implemented handlers, six cause-30
 microcode stubs, and additional mask/rounding checks.
+It runs both 61-site scalar-integer cases covering all 43 arithmetic handlers
+and selected zero-divisor, signed-overflow, and oversized-shift cases.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
+`python3 tools/compare.py --reuse` independently audits the saved real execution
+artifacts and freshly executes only the ADD-to-MUL patched ELF. Its report
+labels that mode and records the actual number of fresh device executions.
+The default command still reruns every example. Saved artifacts must pass
+the same raw-trace/ELF/register/memory audits; missing evidence fails.
 `tools/inventory.py` reads the selected ET Platform source, checks it against
 the setup-recorded revision, and writes the decoder inventory to `out/isa/`.
 
@@ -114,18 +122,20 @@ or wrong-thread isolation, overflow and ordered FLB evidence.
 Both M/U message-port permission cases must supply successful U reads,
 expected privilege/disabled-port faults and retained-message evidence.
 Both scalar-FP cases must supply all 22 implemented handlers and all six
-expected faults. This flag checks the implemented suites; the broader CPU
+expected faults. Both scalar-integer cases must supply all 43 handlers and
+their selected arithmetic edge cases. This flag checks the implemented suites; the broader CPU
 inventory still has explicit gaps and is not a claim of complete base-ISA coverage.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
-and **112 handlers without dedicated per-operation audit coverage**.
-Those 112 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other 110 include ordinary base instructions, architectural trap handlers,
+43 scalar-integer handlers, and **69 handlers without dedicated per-operation audit coverage**.
+Those 69 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other 67 include ordinary base instructions, architectural trap handlers,
 and reserved/illegal compressed handlers. These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
 The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
+The scalar-integer audit is `out/isa/scalar-integer-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -383,6 +393,39 @@ reference, control-state, fault, and whole-memory checks. Normal completion and
 one final `wfi` are required; the 20,000-cycle watchdog and 90-second simulator
 timeout fail incomplete execution. Exhaustive IEEE edge/exception coverage is
 not claimed for these selected inputs.
+
+### Scalar integer arithmetic
+
+`scalar_integer.py` runs all 43 active scalar arithmetic handlers from
+[`arith.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/arith.cpp)
+and [`muldiv.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/muldiv.cpp).
+Each of two cases has 61 sites: 43 ordinary arithmetic/shift/compare/immediate/
+upper-immediate operations, eight zero-divisor cases, four signed-overflow
+cases, and six register shifts with counts 65 or 129.
+
+The program loads actual 64-bit operands into x10/x11, seeds x20, executes the
+visible selected instruction, and stores all three registers before and after
+into guarded 128-byte records. Only x20 changes. Whole monitor memory must
+match the reference, including unchanged operands, guards, and trap records.
+The test uses both sign-bit cases and distinct upper/lower 32-bit words.
+Word instructions ignore the high input bits and sign-extend their 32-bit result;
+register shifts use the low five or six count bits. Multiply-high distinguishes
+signed/signed, signed/unsigned, and unsigned/unsigned products. Signed division
+truncates toward zero, including `-17 / 5 -> -3` and remainder `-2`.
+
+Zero-divisor quotient results are all ones; remainders retain the dividend
+(sign-extended from 32 bits for word operations). Minimum signed values divided
+by -1 return the minimum bit pattern, with remainder zero. `lui` checks signed
+32-bit upper-immediate expansion; `auipc` adds that expansion to the actual
+operation PC derived from ELF symbols and observed in the trace.
+
+The independent audit derives opcode/funct3/funct7/immediate fields from the
+actual four instruction bytes using the pinned decoder tables, repeats the
+arithmetic reference with actual loaded operands, and matches every device
+load, register read/write, and snapshot store. An unexpected trap, missing
+completion, watchdog expiry, timeout, or changed guard fails. The program needs
+no FP register initialization. Exhaustive operands/aliases and SysEmu software
+hints encoded as `slti x0,x0,hint` are not covered by this batch.
 
 ### Packed memory and atomics
 
@@ -935,6 +978,7 @@ SUB: [-9, -18, -27, -36, -45, -54, -63, -72]
 GEMM C[0,:]: [204, 408, 612, 816, 1020, 1224, 1428, 1632]
 PACKED FP: 38/38 operation sites pass in both primary and exact cases
 SCALAR FP: 31/31 sites per case; all 22 implemented handlers and 6 cause-30 stubs pass
+SCALAR INTEGER: 61/61 sites per case; all 43 scalar arithmetic handlers pass
 PACKED INTEGER: 41/41 sites pass in both primary and exact cases
 PACKED MEMORY: 33/33 sites pass in both primary and exact cases
 PACKED ATOMIC: 22/22 sites pass in primary, exact, and alias cases
@@ -981,8 +1025,9 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser. The current
-`tools/compare.py` adds those two executions (42 device runs per complete run);
-that expanded driver has not yet completed a full comparison.
+Together with scalar integer, the current default driver has 44 device runs
+per complete run. That expanded driver has not yet completed a fresh full
+comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
 is preserved under `out/compare/checkpoints/message-port-privilege-source/`
 at commit `2f71f6b`. Its final inventory audit also checks the independently run
@@ -991,6 +1036,10 @@ The actual repository command `python3 examples/scalar_fp.py` and its exit zero
 are saved in `out/scalar-fp-all-console.log` and the matching `.exit` file.
 `out/isa/scalar-fp-inventory.log` records the independent audit; its `.exit`
 file must be zero before treating this checkpoint as verified.
+Both actual scalar-integer cases passed, with the repository command and exit
+status saved in `out/scalar-integer-all-console.log` and its `.exit` file.
+The independent audit is recorded in `out/isa/scalar-integer-inventory.log`
+and the matching `.exit` file; it checks both actual ELF/trace/memory sets.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1014,6 +1063,12 @@ Generated outputs are ignored by Git and remain in `out/`:
   instruction bytes and decoded words, raw traces, complete destination and
   reconstructed source registers, mask/FCSR/trap CSR reads, prestart memory,
   actual/expected guarded memory, and command logs.
+- `out/scalar-integer/`: both actual 61-site integer programs, ELF/PT_LOAD
+  layouts, instruction encodings, raw input-load/register/snapshot-store events,
+  before/after registers, complete guarded memory, and reproducible command logs.
+- `out/isa/scalar-integer-inventory.json`: all 43 handlers matched against the
+  pinned definitions, independently decoded operation fields and arithmetic
+  references, zero/overflow/overshift evidence, and artifact/source hashes.
 - `out/isa/scalar-fp-inventory.json`: independently checked scalar-FP ELF,
   register events, references, six cause-30 faults, full memory, pinned source
   hashes, and both sets of artifact hashes.
