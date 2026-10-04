@@ -1291,7 +1291,172 @@ def scalar_integer_evidence(source_root: Path, commit: str) -> tuple[dict[str, o
     return report,missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict) -> dict:
+def base_memory_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Independently audit ordinary memory decoder fields and actual state effects."""
+    selected={name for name,row in definitions(source_root/'sw-sysemu/insns').items()
+              if row['source'] in ('insns/arith_loadstore.cpp','insns/float_loadstore.cpp')}
+    if selected!={'lb','lbu','lh','lhu','lw','lwu','ld','sb','sh','sw','sd','flw','fsw','fence'}:
+        raise RuntimeError('pinned base-memory handler inventory changed')
+    def signed12(value): return value-4096 if value&2048 else value
+    def decode(word):
+        # processor.cpp dec_load, dec_store, dec_load_fp, dec_store_fp, dec_misc_mem.
+        opcode,f3=word&127,word>>12&7
+        if opcode==3:
+            name=('lb','lh','lw','ld','lbu','lhu','lwu',None)[f3]; kind='load'
+        elif opcode==0x23:
+            name=('sb','sh','sw','sd',None,None,None,None)[f3]; kind='store'
+        elif opcode in (7,0x27) and f3==2:
+            name='flw' if opcode==7 else 'fsw'; kind='load' if opcode==7 else 'store'
+        elif opcode==0xF and f3==0:
+            if word!=0x0FF0000F: raise RuntimeError('unexpected fence predecessor/successor encoding')
+            return 'fence','fence',0,0
+        else: raise RuntimeError('unexpected ordinary memory opcode/funct3')
+        if name is None or word>>15&31!=10: raise RuntimeError('invalid memory selector/base field')
+        if kind=='load' and word>>7&31!=20 or kind=='store' and word>>20&31!=11:
+            raise RuntimeError('base-memory destination/source register field differs')
+        immediate=signed12(word>>20 if kind=='load' else ((word>>25)<<5)|(word>>7&31))
+        width=32 if name in ('flw','fsw') else (8,16,32,64)[f3&3]
+        return name,kind,width,immediate
+    runs,missing=[],[]
+    for case in ('primary','exact'):
+        directory=ROOT/'out/base-memory'/('' if case=='primary' else case)
+        required=('result.json','registers.json','operations.json','elf-layout.json','kernel.S','link.ld',
+                  'kernel.elf','kernel.asm','text.bin','operations.bin','op.bin','elf-inspection.txt',
+                  'symbols.txt','commands.log','prestart.bin','output.bin','expected.bin')
+        run_name=str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required): missing.append(run_name); continue
+        result,registers,sites,layout=(json.loads((directory/name).read_text()) for name in
+                                      ('result.json','registers.json','operations.json','elf-layout.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case']!=case or (result['operation_count'],result['handler_count'],result['trap_count'])!=(14,14,0):
+            raise RuntimeError('base-memory result count/completion failure')
+        if len(sites)!=14 or len(registers['operations'])!=14 or result['operations']!=registers['operations'] or {s['name'] for s in sites}!=selected:
+            raise RuntimeError('base-memory operation coverage or normalized rows differ')
+        elf,pre,memory=((directory/name).read_bytes() for name in ('kernel.elf','prestart.bin','output.bin'))
+        if elf[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',elf,18)[0]!=243: raise RuntimeError('base-memory ELF architecture mismatch')
+        entry,phoff,shoff=struct.unpack_from('<3Q',elf,24)
+        phsize,phcount,shsize,shcount,strings=struct.unpack_from('<5H',elf,54)
+        segments=[struct.unpack_from('<II6Q',elf,phoff+i*phsize) for i in range(phcount)]
+        sections=[struct.unpack_from('<II4QII2Q',elf,shoff+i*shsize) for i in range(shcount)]
+        names=elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections={names[s[0]:].split(b'\0',1)[0].decode():s for s in sections}
+        if [name for name,s in sections.items() if s[2]&4 and s[5]]!=['.text'] or entry!=int(layout['entry'],16): raise RuntimeError('base-memory executable section/entry mismatch')
+        text=sections['.text']
+        if (directory/'text.bin').read_bytes()!=elf[text[4]:text[4]+text[5]]: raise RuntimeError('base-memory text extraction mismatch')
+        start,size=int(layout['monitor_address'],16),layout['monitor_size']
+        mappings=[p[2]+start-p[3] for p in segments if p[0]==1 and p[3]<=start and start+size<=p[3]+p[5]]
+        if len(mappings)!=1 or len(pre)!=size or len(memory)!=size or pre!=elf[mappings[0]:mappings[0]+size]: raise RuntimeError('base-memory initial inputs/guards differ from linked ELF')
+        syms={s[2]:int(s[0],16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s:=line.split())==3}
+        trace=(directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace or re.search(r'\b(?:trap|exception)\b',trace,re.I): raise RuntimeError('base-memory incomplete/faulting execution')
+        events,current=[],None
+        for line in trace.splitlines():
+            match=re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$',line)
+            if match:
+                current=dict(hart=match[1],pc=int(match[2],16),word=int(match[3],16),decoded=match[4],regs={},memory=[]); events.append(current)
+            elif current is not None:
+                match=re.search(r'\b(f\d+) ([=:]) \{([^}]+)\}',line)
+                if match:
+                    words=tuple(int(x,16) for x in re.findall(r'\d+:0x([0-9a-f]{8})',match[3]))
+                    if len(words)!=8: raise RuntimeError('incomplete base-memory FP register trace')
+                    current['regs'][match[1]+match[2]]=words
+                match=re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['regs'][match[1]+match[2]]=int(match[3],16)
+                match=re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['memory'].append((int(match[1]),int(match[2],16),match[3],int(match[4],16)))
+        if any(e['hart']!='H0 S0:N0:C0:T0' for e in events): raise RuntimeError('base-memory unexpected executing hart')
+        def event(name):
+            matches=[e for e in events if e['pc']==syms[name]]
+            if len(matches)!=1: raise RuntimeError('base-memory missing/repeated site '+name)
+            return matches[0]
+        state,before={},{}
+        pcs={int(s['pc'],16) for s in sites}
+        for e in events:
+            if e['pc'] in pcs: before[e['pc']]=dict(state)
+            for key,value in e['regs'].items():
+                if key.endswith('='): state[key[:-1]]=value
+        integer=struct.unpack_from('<Q',pre,syms['input_x']-start)[0]
+        fp=struct.unpack_from('<8I',pre,syms['input_fp']-start)
+        if integer!=(0xFEDCBA9889ABCDEF if case=='primary' else 0x0123456776543210) or fp[0]!=(0xBFC00000 if case=='primary' else 0x40200000):
+            raise RuntimeError('base-memory deterministic input case differs')
+        expected=bytearray(pre); assembled=[]
+        for site,row in zip(sites,registers['operations']):
+            name,pc=site['name'],int(site['pc'],16); op=event('op_'+name)
+            offsets=[p[2]+pc-p[3] for p in segments if p[0]==1 and p[1]&1 and p[3]<=pc and pc+4<=p[3]+p[5]]
+            raw=bytes.fromhex(site['bytes_memory_order']); word=int.from_bytes(raw,'little'); assembled.append(raw)
+            if len(raw)!=4 or len(offsets)!=1 or elf[offsets[0]:offsets[0]+4]!=raw or offsets[0]!=int(site['file_offset'],16) or word!=int(site['word'],16) or word!=op['word']:
+                raise RuntimeError('base-memory operation ELF/PC/trace word mismatch')
+            decoded,kind,width,immediate=decode(word)
+            if decoded!=name or site['mnemonic']!=name or site['kind']!=kind or site['width']!=width or (kind!='fence' and site['immediate']!=immediate): raise RuntimeError('memory encoding fields differ from declared operation')
+            if kind!='fence' and immediate!=(24 if case=='primary' else -24): raise RuntimeError('signed memory offset case missing')
+            if op['decoded'].split()[0]!=('lw' if name=='lwu' else name): raise RuntimeError('base-memory trace mnemonic differs from decoder')
+            address=syms['target_'+name]+32; base=address-site['immediate']; offset=syms['record_'+name]-start
+            source=before[pc]; seed=(0xA5A5A5A5,)*8; xseed=0x5AA55AA55AA55AA5
+            if any(source.get(reg)!=value for reg,value in [('f20',seed),('f11',fp),('x10',base),('x11',integer),('x20',xseed)]): raise RuntimeError('memory operand state lacks complete actual write reconstruction')
+            for symbol,reg,words,addr,bits in [('load_x_','x11',(integer,),syms['input_x'],64),('load_fp_','f11',fp,syms['input_fp'],32),('load_seed_','f20',seed,syms['seed'],32)]:
+                load=event(symbol+name)
+                if load['regs'].get(reg+'=')!=(words[0] if bits==64 else words) or load['memory']!=[(bits,addr+j*bits//8,':',v) for j,v in enumerate(words)]: raise RuntimeError('memory input/sentinel load register/MEM events differ')
+            target=syms['target_'+name]-start
+            initial_payload=fp[0] if name=='flw' else integer
+            initial=bytes([0x5A])*32+(initial_payload.to_bytes(8,'little') if kind=='load' else bytes([0x5A])*8)+bytes([0x5A])*88
+            if pre[target:target+128]!=initial or pre[offset:offset+256]!=bytes([0xA5])*256: raise RuntimeError('memory initial target/record guards differ')
+            payload=int.from_bytes(pre[address-start:address-start+width//8],'little'); answer=xseed; after_fp=seed
+            if kind=='load' and name!='flw':
+                answer=payload-(1<<width) if name in ('lb','lh','lw') and payload>>(width-1) else payload
+                answer &= (1<<64)-1
+            elif name=='flw': after_fp=(payload,0,0,0,0,0,0,0)
+            if kind=='load': wanted_mem=[(width,address,':',payload)]
+            elif kind=='store':
+                value=(fp[0] if name=='fsw' else integer)&((1<<width)-1); wanted_mem=[(width,address,'=',value)]
+                expected[address-start:address-start+width//8]=value.to_bytes(width//8,'little')
+            else: wanted_mem=[]
+            if op['memory']!=wanted_mem or kind!='fence' and op['regs'].get('x10:')!=base: raise RuntimeError('actual memory access width/address/value/base differs')
+            if kind=='store' and op['regs'].get('f11:' if name=='fsw' else 'x11:')!=(fp if name=='fsw' else integer): raise RuntimeError('store source read differs')
+            if name=='flw' and op['regs'].get('f20=')!=after_fp or kind=='load' and name!='flw' and op['regs'].get('x20=')!=answer: raise RuntimeError('memory result write differs')
+            if (name!='flw' and 'f20=' in op['regs']) or (kind!='load' or name=='flw') and 'x20=' in op['regs']: raise RuntimeError('unexpected memory destination write')
+            if any(row[k]!=site[k] for k in ('name','mnemonic','pc','word','bytes_memory_order')) or row['hart']!=op['hart'] or int(row['address'],16)!=address: raise RuntimeError('normalized memory site identity differs')
+            for reg,phase,off,words in [('f20','before',0,seed),('f20','after',32,after_fp),('f11','before',64,fp),('f11','after',96,fp)]:
+                snapshot=event(f'{phase}_{reg}_{name}')
+                if snapshot['regs'].get(reg+':')!=words or snapshot['memory']!=[(32,start+offset+off+4*j,'=',v) for j,v in enumerate(words)]: raise RuntimeError('FP snapshot read/store differs from independent reference')
+                if row[reg+'_'+phase]['raw_u32']!=[f'0x{v:08x}' for v in words]: raise RuntimeError('normalized FP memory result differs')
+                struct.pack_into('<8I',expected,offset+off,*words)
+            wanted=(base,integer,xseed,base,integer,answer)
+            for j,(phase,reg,xreg) in enumerate((p,r,x) for p in ('before','after') for r,x in [('a0','x10'),('a1','x11'),('s4','x20')]):
+                snapshot=event(f'{phase}_{reg}_{name}')
+                if snapshot['regs'].get(xreg+':')!=wanted[j] or snapshot['memory']!=[(64,start+offset+128+8*j,'=',wanted[j])] or int(row[xreg+'_'+phase],16)!=wanted[j]: raise RuntimeError('scalar memory snapshot/reference differs')
+            struct.pack_into('<6Q',expected,offset+128,*wanted)
+            for category,off in [('mask',176),('fcsr',192),('mstatus',208)]:
+                reads=[event(f'{phase}_{category}_{name}') for phase in ('before','after')]
+                for read in reads:
+                    word=read['word']
+                    if category=='mask':
+                        if word&127!=0x7B or word>>25!=0x6B or word&0x01FFF000 or word>>7&31!=5:
+                            raise RuntimeError('mask snapshot is not actual mova.x.m x5')
+                    elif word&0xFFFFF!=0x022F3 or word>>20!=({'fcsr':3,'mstatus':0x300}[category]):
+                        raise RuntimeError('FP control snapshot is not actual CSR read')
+                pair=[read['regs'].get('x5=') for read in reads]
+                if pair[0]!=pair[1] or category!='mstatus' and pair!=[0,0] or category=='mstatus' and (pair[0]&0x6008)!=0x6000: raise RuntimeError('FP/mask/status initialization or preservation differs')
+                for phase,value in zip(('before','after'),pair):
+                    store=event(f'store_{phase}_{category}_{name}')
+                    if store['regs'].get('x5:')!=value or store['memory']!=[(64,start+offset+off+8*(phase=='after'),'=',value)] or int(row[category+'_'+phase],16)!=value: raise RuntimeError('actual control-state snapshot differs')
+                struct.pack_into('<2Q',expected,offset+off,*pair)
+            if bytes.fromhex(row['target_before_bytes'])!=pre[target:target+128] or bytes.fromhex(row['target_after_bytes'])!=memory[target:target+128]: raise RuntimeError('normalized target bytes differ from actual dumps')
+            if row['memory_events']!=[dict(width=w,address=hex(a),access=access,value=hex(v)) for w,a,access,v in wanted_mem]: raise RuntimeError('normalized memory events differ from raw access events')
+        if (directory/'operations.bin').read_bytes()!=b''.join(assembled) or (directory/'op.bin').read_bytes()!=assembled[0]: raise RuntimeError('memory operation binary extraction differs')
+        struct.pack_into('<I',expected,syms['completion']-start,0x4B4F5445)
+        if memory!=expected or (directory/'expected.bin').read_bytes()!=expected or not event('park')['decoded'].startswith('wfi'): raise RuntimeError('whole guarded memory/completion differs')
+        runs.append(dict(run=run_name,validated_sites=14,handler_count=14,**{'pass':True},sha256={name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths=('processor.cpp','insns/arith_loadstore.cpp','insns/float_loadstore.cpp','insn_util.h','insn.h')
+    report=dict(scope='ordinary scalar memory instruction fields, signed offsets, actual register/MEM events and whole guarded dumps; separate from coherent and packed handlers',
+        et_platform_commit=commit,verified_handlers=sorted(selected) if not missing else [],verified_runs=runs,runs_missing_evidence=missing,
+        limitations=['aligned selected cases only; misalignment/page/protection faults, aliases and concurrent memory ordering are not covered',
+                    'fence handler only logs and returns in this SysEmu revision; this checks decoded execution and state preservation, not hardware ordering',
+                    'lwu is labeled lw in SysEmu trace; opcode=3/funct3=6 and actual zero-extended result establish lwu identity'],
+        source_sha256={'sw-sysemu/'+name:hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/base-memory-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report,missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -1316,6 +1481,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
     scalar_normal = set(scalar['verified_normal_handlers'])
     scalar_faults = set(scalar['verified_fault_stubs'])
     integer_normal = set(integer['verified_handlers'])
+    memory_normal = set(memory['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
@@ -1323,6 +1489,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                   'scalar FP execution audit' if row['mnemonic'] in scalar_normal else \
                   'scalar FP fault audit' if row['mnemonic'] in scalar_faults else \
                   'scalar integer execution audit' if row['mnemonic'] in integer_normal else \
+                  'ordinary scalar memory execution audit' if name in memory_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
@@ -1335,6 +1502,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         et_extension_fault_checkpoint_count=extension['verified_trap_stub_count'],
         verified_scalar_fp_handler_count=len(scalar_normal),verified_scalar_fp_fault_count=len(scalar_faults),
         verified_scalar_integer_handler_count=len(integer_normal),
+        verified_base_memory_handler_count=len(memory_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
@@ -1418,7 +1586,8 @@ def main() -> int:
     peer_report, missing_peers = synchronization_peer_evidence(source_root, commit)
     scalar_fp_report, missing_scalar_fp = scalar_fp_evidence(source_root, commit)
     integer_report, missing_integer = scalar_integer_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report)
+    memory_report, missing_memory = base_memory_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1434,6 +1603,7 @@ def main() -> int:
     print(f"peer synchronization cases with audited T0/T1 routing/block/wake/overflow: {len(peer_report['verified_runs'])}/4; {ROOT / 'out/isa/synchronization-peer-inventory.json'}")
     print(f"scalar FP: {len(scalar_fp_report['verified_normal_handlers'])}/22 implemented handlers and {len(scalar_fp_report['verified_fault_stubs'])}/6 fault stubs; {ROOT / 'out/isa/scalar-fp-inventory.json'}")
     print(f"scalar integer: {len(integer_report['verified_handlers'])}/43 handlers with actual encoding/register/memory evidence; {ROOT / 'out/isa/scalar-integer-inventory.json'}")
+    print(f"ordinary scalar memory: {len(memory_report['verified_handlers'])}/14 handlers with actual width/address/register/memory evidence; {ROOT / 'out/isa/base-memory-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -1452,6 +1622,8 @@ def main() -> int:
         raise RuntimeError("incomplete scalar FP execution/fault evidence; inspect the separate scalar FP inventory")
     if "--require-complete" in sys.argv and missing_integer:
         raise RuntimeError("incomplete scalar integer execution/register evidence; inspect the separate integer inventory")
+    if "--require-complete" in sys.argv and missing_memory:
+        raise RuntimeError("incomplete ordinary scalar memory execution/register evidence; inspect the separate memory inventory")
     return 0
 
 

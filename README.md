@@ -31,6 +31,7 @@ python3 examples/packed_int.py
 python3 examples/packed_fp.py
 python3 examples/scalar_fp.py
 python3 examples/scalar_integer.py
+python3 examples/base_memory.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -65,6 +66,8 @@ It also runs both scalar-FP cases: 22 implemented handlers, six cause-30
 microcode stubs, and additional mask/rounding checks.
 It runs both 61-site scalar-integer cases covering all 43 arithmetic handlers
 and selected zero-divisor, signed-overflow, and oversized-shift cases.
+It runs both ordinary scalar-memory cases covering 14 load/store/fence handlers,
+signed address offsets, integer extension/truncation, and all eight FP lanes.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -125,17 +128,21 @@ Both scalar-FP cases must supply all 22 implemented handlers and all six
 expected faults. Both scalar-integer cases must supply all 43 handlers and
 their selected arithmetic edge cases. This flag checks the implemented suites; the broader CPU
 inventory still has explicit gaps and is not a claim of complete base-ISA coverage.
+Both ordinary scalar-memory cases must also supply all 14 handlers with actual
+access-width/address/value, register, control-state, and complete guard evidence.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
-43 scalar-integer handlers, and **69 handlers without dedicated per-operation audit coverage**.
-Those 69 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other 67 include ordinary base instructions, architectural trap handlers,
+43 scalar-integer handlers, 14 ordinary scalar-memory handlers, and
+**55 handlers without dedicated per-operation audit coverage**.
+Those 55 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other 53 include ordinary base instructions, architectural trap handlers,
 and reserved/illegal compressed handlers. These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
 The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
 The scalar-integer audit is `out/isa/scalar-integer-inventory.json`.
+The ordinary scalar-memory audit is `out/isa/base-memory-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -426,6 +433,44 @@ load, register read/write, and snapshot store. An unexpected trap, missing
 completion, watchdog expiry, timeout, or changed guard fails. The program needs
 no FP register initialization. Exhaustive operands/aliases and SysEmu software
 hints encoded as `slti x0,x0,hint` are not covered by this batch.
+
+### Ordinary scalar memory
+
+`base_memory.py` executes all 14 handlers from
+[`arith_loadstore.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/arith_loadstore.cpp)
+and [`float_loadstore.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/float_loadstore.cpp):
+`lb`, `lbu`, `lh`, `lhu`, `lw`, `lwu`, `ld`, `sb`, `sh`, `sw`, `sd`, `flw`,
+`fsw`, and `fence`. These are separate from the earlier coherent/atomic
+`scalar_memory.py` suite. Both cases use aligned payloads in guarded 128-byte
+targets. The primary case addresses them with offset +24 and a negative-bit
+payload `0xfedcba9889abcdef`; the second uses offset -24 and positive payload
+`0x0123456776543210`. The actual base register differs accordingly.
+
+Signed integer loads extend the sign bit, unsigned loads extend with zeros,
+and stores retain only their width's low source bits. The measured primary
+`lw` result is `0xffffffff89abcdef`, versus `lwu` result `0x89abcdef`.
+SysEmu logs both as `lw`; the audit distinguishes `lwu` using actual opcode 3,
+funct3 6, and its zero-extended result, following the pinned decoder table.
+The ET toolchain disassembly correctly names it `lwu`.
+
+M0 is explicitly zero, FP state enabled, and FCSR cleared. Scalar `flw` still
+loads lane 0 and clears lanes 1 through 7, as implemented by `LOAD_FD` in
+[`insn_util.h`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insn_util.h).
+Both cases load exactly representable values (-1.5 and 2.5). `fsw` stores only
+lane 0 of a real eight-lane source and preserves the whole register. Unmasked
+`flq2`/`fsq2` initialize and capture all lanes independently of M0.
+Each guarded 256-byte record contains f20/f11 and x10/x11/x20 before/after,
+plus real M0, FCSR, and mstatus reads. Raw MEM events prove access width,
+effective address, direction and value. Whole monitor equality checks every
+target, sentinel, guard, input, trap record, and completion word.
+
+The independent parser decodes the real instruction bytes, reconstructs
+source state from complete register writes, and checks every operand load and
+snapshot store. `fence iorw,iorw` (`0x0ff0000f`) executes and preserves state;
+the pinned simulator handler only logs and returns. This provides no concurrent
+memory-ordering or hardware-fence claim. Misalignment/page/protection faults
+and exhaustive aliases are not covered by these selected cases. Both the
+20,000-cycle watchdog and 90-second simulator timeout remain mandatory.
 
 ### Packed memory and atomics
 
@@ -1025,7 +1070,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
-Together with scalar integer, the current default driver has 44 device runs
+Together with scalar integer and ordinary scalar memory, the current default driver has 46 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
@@ -1059,6 +1104,11 @@ the earlier 40-run summary was restored from the unchanged example artifacts,
 archived original comparison/patched evidence, and the immutable `693fc4b`
 source tree. The new summary has its own `scalar-integer-completion-audit.json`
 path. No raw execution artifacts were changed by that correction.
+Both actual ordinary scalar-memory cases and their independent audit passed.
+The command `python3 examples/base_memory.py`, observed results, and exit zero
+are saved in `out/base-memory-all-console.log` and its matching `.exit` file.
+`out/isa/base-memory-inventory.log` and its zero `.exit` file record the
+independent 14-handler audit of both actual ELF/trace/memory sets.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1085,6 +1135,12 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/scalar-integer/`: both actual 61-site integer programs, ELF/PT_LOAD
   layouts, instruction encodings, raw input-load/register/snapshot-store events,
   before/after registers, complete guarded memory, and reproducible command logs.
+- `out/base-memory/`: both actual 14-site ordinary scalar-memory programs,
+  signed-offset instruction encodings, all eight source/destination FP lanes,
+  scalar and M0/FCSR/mstatus snapshots, real memory access events, whole guarded
+  targets, ELF-derived inputs, and command logs.
+- `out/isa/base-memory-inventory.json`: all 14 handler identities, independent
+  decoder-field and raw state/memory checks, both cases, and artifact/source hashes.
 - `out/isa/scalar-integer-inventory.json`: all 43 handlers matched against the
   pinned definitions, independently decoded operation fields and arithmetic
   references, zero/overflow/overshift evidence, and artifact/source hashes.
@@ -1098,7 +1154,10 @@ Generated outputs are ignored by Git and remain in `out/`:
   example ELF executions plus one fresh patched run, all raw artifact/upstream
   hashes, both scalar-FP/integer cases, all executable section dumps, complete
   guarded outputs, and the single changed ADD ELF byte. Its mode is recorded
-  explicitly; a fresh full 44-run default comparison remains unrun.
+  explicitly; at that checkpoint the fresh full 44-run default comparison
+  remained unrun. Its reports and comparison/patched evidence are preserved in
+  `out/isa/checkpoints/before-base-memory/` and
+  `out/compare/checkpoints/scalar-integer-completed/`.
 - `out/packed-int/`: 30 vector operations and 11 mask-operation sites,
   per-PC instruction encodings, trace register writes, masks, counts, and
   output-memory evidence for both deterministic cases.

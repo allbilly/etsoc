@@ -183,7 +183,8 @@ def main() -> int:
                    ROOT / "examples" / "trap_stubs.py", ROOT / "examples" / "cache_control.py",
                    ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
                    ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py",
-                   ROOT / "examples" / "scalar_fp.py", ROOT / "examples" / "scalar_integer.py"):
+                   ROOT / "examples" / "scalar_fp.py", ROOT / "examples" / "scalar_integer.py",
+                   ROOT / "examples" / "base_memory.py"):
         if reuse:
             continue
         # Four peer cases audit every event in roughly 180 MiB of raw traces.
@@ -280,7 +281,7 @@ def main() -> int:
     evidence_reports = [inventory, *[json.loads((ROOT / "out/isa" / filename).read_text()) for filename in
         ('cache-csr-inventory.json','synchronization-inventory.json','message-port-inventory.json',
          'synchronization-peer-inventory.json','message-port-privilege-inventory.json',
-         'scalar-fp-inventory.json','scalar-integer-inventory.json')]]
+         'scalar-fp-inventory.json','scalar-integer-inventory.json','base-memory-inventory.json')]]
     example_runs = {run['run'] for evidence in evidence_reports for run in evidence['verified_runs']}
     example_runs.update(run['run'] for rows in inventory['trap_evidence'].values() for run in rows)
     integer_results = [json.loads((ROOT / "out/scalar-integer" / suffix / "result.json").read_text())
@@ -288,6 +289,11 @@ def main() -> int:
     if any(not result['pass'] or (result['operation_count'],result['handler_count'],result['trap_count']) != (61,43,0)
            for result in integer_results):
         raise RuntimeError('scalar integer primary/exact execution, register or guard checks failed')
+    base_memory_results = [json.loads((ROOT / "out/base-memory" / suffix / "result.json").read_text())
+                           for suffix in ("", "exact")]
+    if any(not result['pass'] or (result['operation_count'],result['handler_count'],result['trap_count']) != (14,14,0)
+           for result in base_memory_results):
+        raise RuntimeError('ordinary scalar memory execution, register or guard checks failed')
 
     add_root, mul_root, sub_root = (ROOT / "out" / name for name in ("add", "mul", "sub"))
     add_layout = json.loads((add_root / "elf-layout.json").read_text())
@@ -502,6 +508,8 @@ def main() -> int:
                          "cases": {result['case']: result['pass'] for result in scalar_fp_results}},
         "scalar_integer": {"instruction_count": 61, "handler_count": 43,
                            "cases": {result['case']: result['pass'] for result in integer_results}},
+        "base_memory": {"instruction_count": 14, "handler_count": 14,
+                        "cases": {result['case']: result['pass'] for result in base_memory_results}},
         "cpu_handler_coverage": {key: cpu_inventory[key] for key in
             ('decoded_handler_count','verified_dedicated_handler_count','remaining_dedicated_handler_count',
              'remaining_other_handler_count','remaining_explicit_mcode_stub_count')},
