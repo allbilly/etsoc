@@ -34,6 +34,7 @@ python3 examples/scalar_integer.py
 python3 examples/base_memory.py
 python3 examples/branches.py
 python3 examples/compressed.py
+python3 examples/csr.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -74,6 +75,8 @@ It runs both 16-site branch/jump cases: all eight handlers, both conditional
 outcomes, forward/backward targets, link writes, x0 discard and a `jalr` alias.
 It runs both 36-site compressed cases: all 33 compressed handlers plus
 `c.ebreak`, including arithmetic, memory, control flow and expected faults.
+It runs both 26-site CSR cases: all six instruction forms, zero register and
+immediate rules, and six read-only faults with preserved destinations.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -140,14 +143,17 @@ Both branch/jump cases must supply all eight handlers, both conditional paths,
 real next PCs, jump link and alias behavior, and complete guarded memory.
 Both compressed cases must supply all 34 selected handlers, two-byte encodings,
 actual register/MEM effects, both zero-branch outcomes and all three expected faults.
+Both CSR cases must supply all six instruction handlers, real CSR read/write
+events, suppressed accesses, guarded snapshots and six expected read-only faults.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
 43 scalar-integer handlers, 14 ordinary scalar-memory handlers, eight
-branch/jump handlers, 33 compressed handlers plus `c.ebreak`, and
-**13 handlers without dedicated per-operation audit coverage**.
-Those 13 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other 11 are ordinary system and CSR handlers. These are handler counts, not a count
+branch/jump handlers, 33 compressed handlers plus `c.ebreak`, six CSR instruction
+handlers, and **seven handlers without dedicated per-operation audit coverage**.
+Those seven include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other five are `ecall`, `ebreak`, `mret`, `sret` and `wfi`.
+These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
 The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
@@ -155,6 +161,7 @@ The scalar-integer audit is `out/isa/scalar-integer-inventory.json`.
 The ordinary scalar-memory audit is `out/isa/base-memory-inventory.json`.
 The branch/jump audit is `out/isa/branch-inventory.json`.
 The compressed audit is `out/isa/compressed-inventory.json`.
+The CSR instruction audit is `out/isa/csr-instruction-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -569,6 +576,64 @@ preserved in `out/isa/attempts/compressed-register-immediate/` and the corrected
 audit passed against the unchanged real execution evidence. Exhaustive hints,
 reserved encodings, immediate ranges and memory-protection faults remain
 outside these selected cases. The usual cycle watchdog and host timeout apply.
+
+### CSR instruction forms
+
+`csr.py` executes `csrrw`, `csrrs`, `csrrc`, `csrrwi`, `csrrsi` and `csrrci`
+at 26 labeled sites per deterministic case. It explicitly seeds full-width
+`mscratch` (`0x340`) from a device load and uses read-only `mhartid` (`0xf14`)
+for successful reads and expected illegal-instruction faults. The selected
+hart is H0, and its real `mhartid` reads return zero. These are CPU instruction
+handlers; the addresses that launch tensor and other engines remain separate.
+
+The source register is x10, the old-value destination is x20 unless explicitly
+x0, and x11 holds the seed. The primary seed/mask are `fedcba9889abcdef` and
+`ffff000055aa00f0`; the exact case uses `0123456776543210` and
+`01234567fedcba98`. Immediate cases use 13 and 23 respectively. Each site resets
+`mscratch` and x20 so prior results cannot conceal missing execution.
+
+The tested rules follow the pinned
+[`dec_system`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/processor.cpp#L718)
+and [CSR handlers](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/zicsr.cpp#L1328):
+
+| Selected case | Actual access rule checked |
+| --- | --- |
+| Ordinary six forms | Return old CSR to x20; write, set or clear using the register value or five-bit immediate |
+| `csrrw/csrrwi rd=x0` | Suppress CSR read and discard the old value; CSR write still occurs |
+| `csrrs/csrrc rs1=x0`, `csrrsi/csrrci imm=0` | Read old CSR and suppress write |
+| `csrrs/csrrc rs1=x10`, x10 holding zero | Perform/log a write even though the resulting value is unchanged |
+| `csrrw rs1=x0`, `csrrwi imm=0` | Write zero and return old CSR when rd is x20 |
+| Read-only `mhartid`, six write attempts | Cause 2, `mepc=operation PC`, `mtval=instruction word`; preserve x20 and all seeded state |
+| Read-only `mhartid`, four no-write forms | Read zero successfully with no CSR write |
+
+`csrrs/csrrc` with x10 holding zero still fault on a read-only CSR: write
+selection depends on the register number. The immediate-zero `csrrwi` case
+also faults because that form always writes. Faulting instructions have no
+completed CSR read/write logs and no destination write. This does not prove
+that an internal `csrget` was never called: the pinned handlers can read the
+old value before `csrset` rejects a read-only write. `mhartid` has no read side effect.
+
+SYSTEM encoding is opcode `0x73`; bits 14:12 select 1/2/3/5/6/7 for the six
+forms, bits 11:7 select rd, bits 19:15 select rs1 or the unsigned immediate,
+and bits 31:20 select the CSR. The measured ordinary register encodings are
+`0x34051a73`, `0x34052a73` and `0x34053a73`. The independent audit decodes
+these fields directly from ELF bytes and matches raw instruction, operand,
+destination and CSR events. It reconstructs the prior GPR/`mscratch` state
+from complete actual writes, rather than filling a register report from inputs.
+
+The program uses the documented M-box `.text`/data/stack layout, disables
+interrupts and delegation, sets SATP bare, disables tensor lanes and installs
+a trap handler. The handler snapshots four fault CSRs and skips four bytes
+only for the six expected cause-2 faults. Unexpected faults record diagnostics
+and fail. Each 192-byte record contains before/after x10/x11/x20, `mscratch`,
+target CSR and real x0 stores, plus fault snapshots and 64 bytes of untouched
+guards. The whole monitor, input bytes, trap count and completion marker are
+checked. The simulator cycle watchdog and 90-second host timeout both apply.
+
+Both actual cases and the independent audit passed. Their console logs and
+exit statuses are `out/csr-all-console.log`/`.exit` and
+`out/isa/csr-instruction-inventory.log`/`.exit`. Exhaustive CSR addresses,
+register aliases and privilege combinations remain outside these selected cases.
 
 ### Packed memory and atomics
 
@@ -1168,7 +1233,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
-Together with scalar integer, ordinary scalar memory, branches and compressed instructions, the current default driver has 50 device runs
+Together with scalar integer, ordinary scalar memory, branches, compressed and CSR instructions, the current default driver has 52 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
@@ -1248,10 +1313,28 @@ freshly executed once. Its log and zero exit status are
 The additional checkpoint audit passed across 49 ELF evidence sets, one fresh
 patched run, 496 artifact/upstream hashes and 23 Python syntax checks; its
 log/zero exit files are `out/isa/compressed-checkpoint-audit.log` and the
-matching `.exit` file. Current dedicated CPU coverage is 340/353 handlers,
-leaving 13. The current default driver requires 50 fresh device runs; that
-full fresh comparison remains outstanding. Saved-artifact mode does not claim
+matching `.exit` file. That checkpoint had dedicated CPU coverage of 340/353 handlers,
+leaving 13. Its default driver required 50 fresh device runs; that
+full fresh comparison was outstanding. Saved-artifact mode does not claim
 50 newly executed programs.
+Both CSR instruction cases and their independent audit have now passed: all
+26 sites per case, six handlers and six expected read-only faults per case.
+The real command `python3 examples/csr.py` and zero exit are preserved in
+`out/csr-all-console.log` and its matching `.exit` file. The independent audit
+is `out/isa/csr-instruction-inventory.log` with a zero `.exit` file. Dedicated
+CPU coverage is now 346/353 handlers, leaving seven. The expanded default
+comparison requires 52 fresh device runs; that full fresh comparison remains
+outstanding. Previous reports and comparison evidence are archived under
+`out/isa/checkpoints/before-csr/` and
+`out/compare/checkpoints/compressed-completed/`.
+The expanded `python3 tools/compare.py --reuse` passed: 51 saved example
+execution sets were independently audited and the copied ADD-to-MUL ELF was
+freshly executed once. Its log and zero exit are
+`out/compare/csr-reuse-console.log` and the matching `.exit` file. The additional
+checkpoint audit passed across those 51 ELF evidence sets and one fresh patched
+run, 530 artifact/upstream hashes and 24 Python syntax checks; its log and zero
+exit are `out/isa/csr-instruction-checkpoint-audit.log` and the matching `.exit`
+file. Saved-artifact mode does not claim 52 newly executed programs.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1296,6 +1379,18 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/isa/compressed-inventory.json`: all 34 selected handlers independently
   decoded and checked against actual register/MEM/control/trap events, plus
   complete guarded outputs and artifact/upstream source hashes.
+- `out/csr/`: both real 26-site programs, SYSTEM encoding fields, CSR read/write
+  logs, register and device snapshots, six expected faults, guarded dumps,
+  completion and command/exit evidence.
+- `out/isa/csr-instruction-inventory.json`: all six instruction handlers
+  independently decoded and checked against real CSR/register/MEM/fault events,
+  prior state reconstructed from actual writes, complete guarded outputs,
+  34 artifact hashes and five pinned upstream source hashes.
+- `out/isa/csr-instruction-completion-audit.json`: comparison checkpoint of 51
+  saved execution sets plus one fresh patched run, 530 artifact/upstream hashes,
+  26 repository source hashes, actual executable-section dumps, complete guarded
+  memory/fault/completion checks and the independently verified single-byte ELF
+  patch. `out/isa/csr-instruction-checkpoint-audit.py` reproduces the artifact audit.
 - `out/isa/compressed-completion-audit.json`: comparison audit of 49 saved
   example executions plus one fresh patched run, 496 artifact/upstream hashes,
   25 repository source hashes, executable-section dumps, complete guard/fault/

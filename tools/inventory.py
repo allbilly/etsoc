@@ -1804,7 +1804,202 @@ def compressed_evidence(source_root: Path, commit: str) -> tuple[dict[str, objec
     return report,missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict, compressed: dict) -> dict:
+def csr_instruction_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Independently decode CSR fields and audit real read/write/fault events."""
+    normal = {name for name, row in definitions(source_root/'sw-sysemu/insns').items()
+              if row['source'] == 'insns/zicsr.cpp' and name.startswith('csrr')}
+    table = {1: 'csrrw', 2: 'csrrs', 3: 'csrrc', 5: 'csrrwi', 6: 'csrrsi', 7: 'csrrci'}
+    if normal != set(table.values()):
+        raise RuntimeError('pinned CSR instruction handler inventory changed')
+    runs, missing = [], []
+    for case in ('primary', 'exact'):
+        directory = ROOT/'out/csr'/('' if case == 'primary' else case)
+        required = ('kernel.S', 'link.ld', 'kernel.elf', 'kernel.asm', 'text.bin', 'op.bin', 'operations.bin',
+                    'operations.json', 'elf-layout.json', 'symbols.txt', 'trace.log', 'registers.json',
+                    'prestart.bin', 'output.bin', 'expected.bin', 'commands.log', 'result.json')
+        run_name = str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required):
+            missing.append(run_name)
+            continue
+        result, layout, sites, registers = (json.loads((directory/name).read_text()) for name in
+            ('result.json', 'elf-layout.json', 'operations.json', 'registers.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case'] != case or \
+                (result['operation_count'], result['handler_count'], result['trap_count']) != (26, 6, 6):
+            raise RuntimeError('incomplete CSR result counts')
+        if len(sites) != 26 or len(registers['operations']) != 26 or {s['handler'] for s in sites} != normal:
+            raise RuntimeError('CSR source handlers lack selected-site coverage')
+        elf, pre, memory = ((directory/name).read_bytes() for name in ('kernel.elf', 'prestart.bin', 'output.bin'))
+        if elf[:6] != b'\x7fELF\x02\x01' or struct.unpack_from('<H', elf, 18)[0] != 243:
+            raise RuntimeError('CSR expected RV64 little-endian ELF')
+        entry, phoff, shoff = struct.unpack_from('<3Q', elf, 24)
+        phsize, phcount, shsize, shcount, strings = struct.unpack_from('<5H', elf, 54)
+        segments = [struct.unpack_from('<II6Q', elf, phoff+i*phsize) for i in range(phcount)]
+        sections = [struct.unpack_from('<II4QII2Q', elf, shoff+i*shsize) for i in range(shcount)]
+        names = elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections = {names[s[0]:].split(b'\0', 1)[0].decode(): s for s in sections}
+        if [name for name, s in sections.items() if s[2]&4 and s[5]] != ['.text'] or entry != int(layout['entry'], 16):
+            raise RuntimeError('CSR ELF entry/executable sections differ')
+        text = sections['.text']
+        if (directory/'text.bin').read_bytes() != elf[text[4]:text[4]+text[5]]:
+            raise RuntimeError('CSR text section extraction differs')
+        start, size = int(layout['monitor_address'], 16), layout['monitor_size']
+        mappings = [p[2]+start-p[3] for p in segments if p[0] == 1 and p[3] <= start and start+size <= p[3]+p[5]]
+        if len(mappings) != 1 or len(pre) != size or len(memory) != size or pre != elf[mappings[0]:mappings[0]+size]:
+            raise RuntimeError('CSR initial memory differs from linked inputs/guards')
+        syms = {s[2]: int(s[0], 16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s := line.split()) == 3}
+        trace = (directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace:
+            raise RuntimeError('CSR incomplete simulation')
+        events, current, state = [], None, {}
+        for line in trace.splitlines():
+            match = re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$', line)
+            if match:
+                current = dict(hart=match[1], pc=int(match[2], 16), word=int(match[3], 16), decoded=match[4],
+                               regs={}, memory=[], csrs=[], before_state=state.copy())
+                events.append(current)
+            elif current is not None:
+                match = re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['regs'][match[1]+match[2]] = int(match[3], 16)
+                    if match[2] == '=':
+                        state[match[1]] = int(match[3], 16)
+                match = re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['memory'].append((int(match[1]), int(match[2], 16), match[3], int(match[4], 16)))
+                match = re.search(r'\t(mscratch|mhartid|mcause|mepc|mtval|mstatus) ([=:]) 0x([0-9a-f]+)', line)
+                if match:
+                    current['csrs'].append((match[1], match[2], int(match[3], 16)))
+                    if match[2] == '=':
+                        state[match[1]] = int(match[3], 16)
+        if any(e['hart'] != 'H0 S0:N0:C0:T0' for e in events):
+            raise RuntimeError('CSR unexpected hart')
+
+        def event(name):
+            matches = [e for e in events if e['pc'] == syms[name]]
+            if len(matches) != 1:
+                raise RuntimeError('CSR missing/repeated actual site: '+name)
+            return matches[0]
+
+        captures = {csr: [e for e in events if e['pc'] == syms['capture_'+csr]] for csr in ('mcause', 'mepc', 'mtval', 'mstatus')}
+        traps = re.findall(r'\[(H\d+ S\d+:N\d+:C\d+:T\d+)\].*Trapping to M-mode with cause 0x([0-9a-f]+) and tval 0x([0-9a-f]+)', trace)
+        expected, fault_index, decoded_sites = bytearray(pre), 0, []
+        seed, mask = ((0xFEDCBA9889ABCDEF, 0xFFFF000055AA00F0) if case == 'primary'
+                      else (0x0123456776543210, 0x01234567FEDCBA98))
+        for site, row in zip(sites, registers['operations']):
+            name, pc = site['name'], int(site['pc'], 16)
+            op = event('op_'+name)
+            offsets = [p[2]+pc-p[3] for p in segments if p[0] == 1 and p[1]&1 and p[3] <= pc and pc+4 <= p[3]+p[5]]
+            raw = bytes.fromhex(site['bytes_memory_order'])
+            word = int.from_bytes(raw, 'little')
+            if len(raw) != 4 or len(offsets) != 1 or raw != elf[offsets[0]:offsets[0]+4] or \
+                    offsets[0] != int(site['file_offset'], 16) or word != int(site['word'], 16) or word != op['word']:
+                raise RuntimeError('CSR operation bytes/offset differ from execution')
+            f3, rd, source, csr = word>>12&7, word>>7&31, word>>15&31, word>>20
+            if word&127 != 0x73 or f3 not in table or rd not in (0, 20) or source not in (0, 1, 10, 13, 23) or csr not in (0x340, 0xF14):
+                raise RuntimeError('CSR encoding field mismatch')
+            mnemonic = table[f3]
+            read, write = f3 not in (1, 5) or rd != 0, f3 in (1, 5) or source != 0
+            faulting = csr == 0xF14 and write
+            if mnemonic != site['mnemonic'] or not op['decoded'].startswith(mnemonic) or \
+                    (rd, source, csr, read, write, 2 if faulting else 0) != \
+                    tuple(site[key] for key in ('rd', 'source', 'csr', 'read', 'write', 'cause')):
+                raise RuntimeError('CSR decoded identity/suppression fields differ')
+            a, loaded_seed = struct.unpack_from('<2Q', pre, syms['input_'+name]-start)
+            if loaded_seed != seed or a != (0 if name.startswith('register_value_zero_') or name in ('readonly_fault_s', 'readonly_fault_c') else mask):
+                raise RuntimeError('CSR deterministic input cases changed')
+            for j, (suffix, reg, value) in enumerate([('a', 'x10', a), ('seed', 'x11', seed)]):
+                load = event('load_'+suffix+'_'+name)
+                if load['regs'].get(reg+'=') != value or load['memory'] != [(64, syms['input_'+name]+8*j, ':', value)]:
+                    raise RuntimeError('CSR input lacks actual load/register write')
+            if event('seed_csr_'+name)['csrs'] != [('mscratch', '=', seed)] or \
+                    any(op['before_state'].get(key) != value for key, value in [('x10', a), ('x11', seed), ('x20', 0x5AA55AA55AA55AA5), ('mscratch', seed)]):
+                raise RuntimeError('CSR prior state not reconstructed from actual writes')
+            csrname, old = ('mscratch', seed) if csr == 0x340 else ('mhartid', 0)
+            operand = source if f3 >= 5 else a if source else 0
+            new = (operand if f3 in (1, 5) else old | operand if f3 in (2, 6) else old & ~operand)&((1<<64)-1)
+            before = [a, seed, 0x5AA55AA55AA55AA5, seed, old, 0]
+            after = before.copy()
+            if not faulting:
+                if rd:
+                    after[2] = old
+                if write:
+                    after[4] = new
+                    if csr == 0x340:
+                        after[3] = new
+            writes = {k: v for k, v in op['regs'].items() if k.endswith('=')}
+            csr_events = [] if faulting else ([(csrname, ':', old)] if read else []) + ([(csrname, '=', new)] if write else [])
+            if op['csrs'] != csr_events or op['memory'] or writes != ({} if faulting or rd == 0 else {'x20=': old}) or \
+                    (f3 < 5 and source != 0 and op['regs'].get('x10:') != a):
+                raise RuntimeError('CSR actual operand/result/read/write event mismatch')
+            offset = syms['record_'+name]-start
+            if pre[offset:offset+192] != bytes([0xA5])*192:
+                raise RuntimeError('CSR initial record sentinel missing')
+            for phase, base, values in [('before', 0, before), ('after', 48, after)]:
+                for j, (suffix, reg, value) in enumerate(zip(('a', 'seed', 'x', 'mscratch', 'target', 'zero'),
+                                                          ('x10', 'x11', 'x20', 'x5', 'x5', None), values)):
+                    snapshot = event(phase+'_'+suffix+'_'+name)
+                    if snapshot['memory'] != [(64, start+offset+base+8*j, '=', value)] or \
+                            (reg is not None and snapshot['regs'].get(reg+':') != value):
+                        raise RuntimeError('CSR device snapshot store differs from independent reference')
+                    if suffix in ('mscratch', 'target'):
+                        read_event = event(phase+'_'+suffix+'_read_'+name)
+                        target = 0x340 if suffix == 'mscratch' else csr
+                        expected_read_word = target<<20 | 2<<12 | 5<<7 | 0x73
+                        if read_event['word'] != expected_read_word or read_event['regs'].get('x5=') != value or \
+                                read_event['csrs'] != [('mscratch' if suffix == 'mscratch' else csrname, ':', value)]:
+                            raise RuntimeError('CSR snapshot read encoding/value differs')
+                for key, value in zip(('x10', 'x11', 'x20', 'mscratch', 'target_csr', 'x0'), values):
+                    if int(row[phase][key], 16) != value:
+                        raise RuntimeError('CSR normalized state differs from actual evidence')
+            struct.pack_into('<12Q', expected, offset, *before, *after)
+            fault = None
+            if faulting:
+                cause, epc, tval, status = struct.unpack_from('<4Q', memory, offset+96)
+                if (cause, epc, tval) != (2, pc, word) or status>>11&3 != 3 or \
+                        fault_index >= len(traps) or traps[fault_index] != ('H0 S0:N0:C0:T0', '2', f'{word:x}'):
+                    raise RuntimeError('CSR raw fault cause/PC/word/MPP differs')
+                for key, value in zip(captures, (cause, epc, tval, status)):
+                    capture = captures[key][fault_index]
+                    if capture['regs'].get('x5=') != value or capture['csrs'] != [(key, ':', value)] or \
+                            capture['memory']:
+                        raise RuntimeError('CSR raw trap-state read differs')
+                    next_event = events[events.index(capture)+1]
+                    if next_event['memory'] != [(64, start+offset+96+8*list(captures).index(key), '=', value)]:
+                        raise RuntimeError('CSR trap-state store differs')
+                struct.pack_into('<4Q', expected, offset+96, cause, epc, tval, status)
+                fault = dict(mcause=cause, mepc=hex(epc), mtval=hex(tval), mstatus=hex(status))
+                fault_index += 1
+            next_pc = events[events.index(op)+1]['pc']
+            if next_pc != (syms['trap_handler'] if faulting else pc+4) or row['next_pc'] != hex(next_pc) or row['fault'] != fault:
+                raise RuntimeError('CSR actual/normalized next-PC/fault differs')
+            if row['csr_events'] != [dict(name=n, access=k, value=hex(v)) for n, k, v in csr_events] or \
+                    row['output_memory_bytes'] != memory[offset:offset+192].hex(' ') or row['hart'] != op['hart'] or \
+                    any(row[k] != site[k] for k in ('name', 'mnemonic', 'pc', 'word', 'bytes_memory_order')):
+                raise RuntimeError('CSR normalized row differs from raw operation')
+            decoded_sites.append(dict(name=name, mnemonic=mnemonic, read=read, write=write, fault=faulting))
+        if fault_index != 6 or len(traps) != 6 or any(len(es) != 6 for es in captures.values()):
+            raise RuntimeError('CSR unexpected/missing traps')
+        struct.pack_into('<Q', expected, syms['trap_count']-start, 6)
+        struct.pack_into('<I', expected, syms['completion']-start, 0x4B4F5445)
+        operation_bytes = b''.join(bytes.fromhex(s['bytes_memory_order']) for s in sites)
+        if memory != expected or (directory/'expected.bin').read_bytes() != expected or \
+                (directory/'operations.bin').read_bytes() != operation_bytes or (directory/'op.bin').read_bytes() != operation_bytes[:4] or \
+                not event('park')['decoded'].startswith('wfi'):
+            raise RuntimeError('CSR complete guarded memory/extraction/termination differs')
+        runs.append(dict(run=run_name, validated_sites=26, handler_count=6, trap_count=6, decoded_sites=decoded_sites,
+                         **{'pass': True}, sha256={name: hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths = ('processor.cpp', 'insns/zicsr.cpp', 'csrs.h', 'insn.h', 'insn_util.h')
+    report = dict(scope='six CSR instruction handlers; mscratch, read-only mhartid, source/destination zero rules and selected M-mode faults',
+        et_platform_commit=commit, verified_handlers=sorted(normal) if not missing else [], verified_runs=runs, runs_missing_evidence=missing,
+        limitations=['selected M-mode CSR instruction cases; exhaustive CSR addresses, aliases and privilege combinations unclaimed',
+                     'CSR-launched tensor/cache/message commands are separate from these six CPU handlers',
+                     'absence of a completed CSR log at a fault does not imply that csrget was not called internally'],
+        source_sha256={'sw-sysemu/'+name: hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/csr-instruction-inventory.json').write_text(json.dumps(report, indent=2)+'\n')
+    return report, missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict, compressed: dict, csr: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -1832,6 +2027,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
     memory_normal = set(memory['verified_handlers'])
     branch_normal = set(branches['verified_handlers'])
     compressed_normal = set(compressed['verified_handlers'])
+    csr_normal = set(csr['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
@@ -1842,6 +2038,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                   'ordinary scalar memory execution audit' if name in memory_normal else \
                   'ordinary branch/jump execution audit' if name in branch_normal else \
                   'compressed execution/architectural fault audit' if name in compressed_normal else \
+                  'CSR instruction execution/read-only fault audit' if name in csr_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
@@ -1857,10 +2054,11 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         verified_base_memory_handler_count=len(memory_normal),
         verified_branch_handler_count=len(branch_normal),
         verified_compressed_handler_count=len(compressed_normal),
+        verified_csr_instruction_handler_count=len(csr_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
-                'Remaining non-microcode handlers include architectural traps and reserved/illegal compressed handlers.',
+                'Unverified handlers are listed explicitly by their dedicated_coverage field.',
                 'Incidental base instructions in startup are not counted as dedicated operation audits.',
                 'Dynamic CSR engine commands are separate; tensor command paths remain unverified.'])
     (ROOT/'out/isa/full-cpu-source-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
@@ -1943,7 +2141,8 @@ def main() -> int:
     memory_report, missing_memory = base_memory_evidence(source_root, commit)
     branch_report, missing_branches = branch_evidence(source_root, commit)
     compressed_report, missing_compressed = compressed_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report, compressed_report)
+    csr_report, missing_csr = csr_instruction_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report, compressed_report, csr_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1962,6 +2161,7 @@ def main() -> int:
     print(f"ordinary scalar memory: {len(memory_report['verified_handlers'])}/14 handlers with actual width/address/register/memory evidence; {ROOT / 'out/isa/base-memory-inventory.json'}")
     print(f"ordinary branch/jump: {len(branch_report['verified_handlers'])}/8 handlers with actual next-PC/link/alias/memory evidence; {ROOT / 'out/isa/branch-inventory.json'}")
     print(f"compressed plus c.ebreak: {len(compressed_report['verified_handlers'])}/34 handlers with actual 16-bit/register/memory/path/fault evidence; {ROOT / 'out/isa/compressed-inventory.json'}")
+    print(f"CSR instruction forms: {len(csr_report['verified_handlers'])}/6 handlers with actual read/write/suppression/fault evidence; {ROOT / 'out/isa/csr-instruction-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -1986,6 +2186,8 @@ def main() -> int:
         raise RuntimeError("incomplete ordinary branch/jump execution evidence; inspect the separate branch inventory")
     if "--require-complete" in sys.argv and missing_compressed:
         raise RuntimeError("incomplete compressed execution/fault evidence; inspect the separate compressed inventory")
+    if "--require-complete" in sys.argv and missing_csr:
+        raise RuntimeError("incomplete CSR instruction execution/fault evidence; inspect the separate CSR instruction inventory")
     return 0
 
 
