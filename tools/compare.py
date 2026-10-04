@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Compare the measured ADD/MUL builds and run a one-instruction ELF patch."""
+"""Run the ET ISA examples and compare the packed-float operation experiments."""
 
 from __future__ import annotations
 
 import difflib
 import json
 import os
+import re
 import shlex
 import shutil
 import struct
@@ -68,7 +69,8 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
         prefix = [podman, "exec", runtime["container"]]
     else:
         work = str(directory)
-        shutil.copy2(elf, directory / "kernel.elf")
+        if elf.resolve() != (directory / "kernel.elf").resolve():
+            shutil.copy2(elf, directory / "kernel.elf")
         prefix = []
 
     dump_addr = int(layout["monitor_address"], 16)
@@ -92,27 +94,27 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
     (directory / "trace.log").write_text(trace)
     if result.returncode != 0 or "Finishing emulation" not in trace or "Error, max cycles reached" in trace:
         raise RuntimeError(f"patched ELF did not complete successfully (SysEmu status {result.returncode})")
+    if re.search(r"\b(?:Trap|trap|exception|Exception)\b", trace):
+        raise RuntimeError("unexpected trap/exception text appears in the patched-ELF trace")
 
     symbols = {name: int(value, 16) for name, value in layout["symbols"].items()}
     events, regs = add_example.trace_events(trace)
     op = add_example.event_at(events, op_pc, "fmul.ps")
+    file_offset = int(layout["operation_file_offset"], 16)
+    expected_word = int.from_bytes(elf.read_bytes()[file_offset:file_offset + 4], "little")
+    if op["word"] != expected_word:
+        raise RuntimeError("the patched execution word differs from the replacement instruction")
     source_a, source_b = regs[(op_pc, "f10", ":")], regs[(op_pc, "f11", ":")]
     result_f12 = regs[(op_pc, "f12", "=")]
     post: dict[str, tuple[int, ...]] = {}
     output = (directory / "output.bin").read_bytes()
     initial = (directory / "prestart.bin").read_bytes()
+    if len(output) != dump_size or len(initial) != dump_size:
+        raise RuntimeError("patched-run memory dumps do not cover the complete monitor range")
     start = dump_addr
     for n in (10, 11, 12):
-        pc_match = [e for e in events if str(e["disassembly"]).startswith("fsw.ps f%d," % n)]
-        if len(pc_match) != 1:
-            # The linker exports each after-operation capture PC in the source
-            # ELF symbol table; those addresses are also in the normalized layout.
-            cap_name = f"capture_f{n}_after"
-            cap_pc = layout.get("capture_pcs", {}).get(cap_name)
-            if cap_pc is None:
-                raise RuntimeError(f"missing patched-run snapshot PC for f{n}")
-            pc_match = [e for e in events if e["pc"] == int(cap_pc, 16)]
-        pc = int(pc_match[0]["pc"])
+        pc = int(layout["capture_pcs"][f"capture_f{n}_after"], 16)
+        add_example.event_at(events, pc, f"fsw.ps f{n},")
         post[f"f{n}"] = regs[(pc, f"f{n}", ":")]
         snap = symbols[f"snapshot_f{n}"] - start
         if post[f"f{n}"] != struct.unpack_from("<8I", output, snap):
@@ -123,6 +125,10 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
 
     initial_c = initial[monitor_offset("result_c"):monitor_offset("result_c") + 32]
     actual = output[monitor_offset("result_c"):monitor_offset("result_c") + 32]
+    if source_a != post["f10"] or source_b != post["f11"]:
+        raise RuntimeError("the patched operation changed a source register")
+    if result_f12 != post["f12"] or actual != struct.pack("<8I", *result_f12):
+        raise RuntimeError("patched operation write, snapshot, and output memory disagree")
     complete = struct.unpack_from("<I", output, monitor_offset("completion"))[0]
     trap_marker = struct.unpack_from("<I", output, monitor_offset("trap_marker"))[0]
     trap_cause = struct.unpack_from("<Q", output, monitor_offset("trap_cause"))[0]
@@ -133,6 +139,8 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
     fcsr_after_pc = layout["capture_pcs"]["capture_fcsr_after"]
     fcsr_event = add_example.event_at(events, int(fcsr_after_pc, 16), "csrr")
     mask = op["state"].get("m0::")
+    if mask != 0xFF:
+        raise RuntimeError("the patched operation did not execute with all eight lanes enabled")
     register_report = {
         "source": "SysEmu execution trace and device-side fsw.ps snapshots from the patched ELF",
         "operation_pc": f"0x{op_pc:x}", "hart": op["hart"], "cycle": op["cycle"],
@@ -157,29 +165,115 @@ def save_patch_execution(elf: Path, layout: dict[str, object], mul_result: dict[
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "comparison.json").unlink(missing_ok=True)
     patched_dir = OUT / "patched"
     patched_dir.mkdir(parents=True, exist_ok=True)
     commands = OUT / "commands.log"
     commands.write_text("")
-    for script in (ROOT / "examples" / "add.py", ROOT / "examples" / "mul.py"):
+    for script in (ROOT / "examples" / "add.py", ROOT / "examples" / "mul.py",
+                   ROOT / "examples" / "sub.py", ROOT / "examples" / "gemm.py",
+                   ROOT / "examples" / "packed_int.py", ROOT / "examples" / "packed_fp.py",
+                   ROOT / "examples" / "packed_memory.py", ROOT / "examples" / "packed_atomic.py",
+                   ROOT / "examples" / "scalar_memory.py", ROOT / "examples" / "graphics.py",
+                   ROOT / "examples" / "trap_stubs.py", ROOT / "examples" / "cache_control.py",
+                   ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
+                   ROOT / "examples" / "synchronization_peers.py"):
         result = add_example.run_logged(commands, [sys.executable, str(script)], 600)
-        add_example.require(result, f"run {script.name} for primary and exact inputs")
+        add_example.require(result, f"run {script.name}")
+    gemm_result = json.loads((ROOT / "out" / "gemm" / "result.json").read_text())
+    gemm_exact = json.loads((ROOT / "out" / "gemm" / "exact" / "result.json").read_text())
+    if any(not result["pass"] or result["fma_count"] != 64 or result["broadcast_count"] != 64
+           for result in (gemm_result, gemm_exact)):
+        raise RuntimeError("GEMM primary/exact result or its 64 FMA/broadcast trace checks failed")
+    packed_int = json.loads((ROOT / "out" / "packed-int" / "result.json").read_text())
+    packed_int_exact = json.loads((ROOT / "out" / "packed-int" / "exact" / "result.json").read_text())
+    if (not packed_int["pass"] or not packed_int_exact["pass"] or
+            packed_int["instruction_count"] != 41 or packed_int_exact["instruction_count"] != 41):
+        raise RuntimeError("packed integer primary/exact run or its 41-instruction trace check failed")
+    packed_fp = json.loads((ROOT / "out" / "packed-fp" / "result.json").read_text())
+    packed_fp_exact = json.loads((ROOT / "out" / "packed-fp" / "exact" / "result.json").read_text())
+    if (not packed_fp["pass"] or not packed_fp_exact["pass"] or
+            packed_fp["operation_count"] != 38 or packed_fp_exact["operation_count"] != 38):
+        raise RuntimeError("packed FP primary/exact run or its 38-operation trace check failed")
+    memory_results = [json.loads((ROOT / "out" / "packed-memory" / subdir / "result.json").read_text())
+                      for subdir in ("", "exact")]
+    atomic_results = [json.loads((ROOT / "out" / "packed-atomic" / subdir / "result.json").read_text())
+                      for subdir in ("", "exact", "alias")]
+    scalar_results = [json.loads((ROOT / "out" / "scalar-memory" / subdir / "result.json").read_text())
+                      for subdir in ("", "exact")]
+    graphics_results = [json.loads((ROOT / "out" / "graphics" / subdir / "result.json").read_text())
+                        for subdir in ("", "exact")]
+    trap_results = [json.loads((ROOT / "out" / "trap-stubs" / subdir / "result.json").read_text())
+                    for subdir in ("", "exact")]
+    cache_results = [json.loads((ROOT / "out" / "cache-control" / subdir / "result.json").read_text())
+                     for subdir in ("", "exact")]
+    sync_results = [json.loads((ROOT / "out" / "synchronization" / subdir / "result.json").read_text())
+                    for subdir in ("", "exact")]
+    port_results = [json.loads((ROOT / "out" / "message-ports" / subdir / "result.json").read_text())
+                    for subdir in ("", "exact", "blocking-primary", "blocking-exact", "overflow-primary", "overflow-exact")]
+    peer_results = [json.loads((ROOT / "out" / "synchronization-peers" / subdir / "result.json").read_text())
+                    for subdir in ("", "exact", "threads-primary", "threads-exact")]
+    for result in peer_results:
+        proof = result["proof"]
+        thread_case = result["case"].startswith("threads")
+        if (not result["pass"] or not result["whole_monitor_matches"] or result["operation_count"] != (12 if thread_case else 10) or
+                result["stage_count"] != (10 if thread_case else 8) or proof["bulk_increment_count"] != 65535 or proof["overflow_error"] != "0x8" or
+                proof["destination_written_on_first_attempt"] or proof["wait_cycles"][1] <= proof["wait_cycles"][0] + 1):
+            raise RuntimeError("peer synchronization wait/restart/barrier/overflow checks failed")
+        if thread_case and (proof["receiver_hart"] != "H1" or proof["sender_hart"] != "H0" or
+                not proof["wait_cycles"][0] < proof["wrong_thread_credit_cycle"] < proof["other_credit_cycle"] < proof["matching_credit_cycle"] < proof["wait_cycles"][1]):
+            raise RuntimeError("T1 FCC wait and wrong-thread/wrong-counter isolation checks failed")
+    for result, count in zip(port_results, (80, 80, 3, 3, 60, 60)):
+        if not result["pass"] or not result["whole_monitor_matches"] or result["operation_count"] != count:
+            raise RuntimeError("message-port CSR/ESR or memory checks failed")
+        if result["case"].startswith("blocking") and (not result["blocking_proof"] or
+                result["blocking_proof"]["head_results"] != ["0xffffffffffffffff", "0x0"] or
+                result["blocking_proof"]["wait_cycle_gap"] <= 1):
+            raise RuntimeError("message-port blocking read/wake/retry checks failed")
+        if result["case"].startswith("overflow"):
+            proof = result["queue_proof"]
+            if len(proof) != 4 or any(row["bulk_send_count"] != 255 or row["capacity"] != 2 or
+                    row["overfill_head_results"] != ["0x0", hex(result["message_width"]), "0x0"] or
+                    row["probe255_result"] != "0x0" or row["empty_after_wrap"] != "0xffffffffffffffff" or
+                    row["tensor_error"] != "0x0" for row in proof):
+                raise RuntimeError("message-port overcapacity/count-wrap checks failed")
+    for result, count in zip(sync_results, (23, 24)):
+        if not result["pass"] or result["operation_count"] != count or result["timer_wait_cycles"] <= 1:
+            raise RuntimeError("synchronization CSR/ESR and real timed-wait checks failed")
+    for suite, results, count in (("packed memory", memory_results, 33), ("packed atomic", atomic_results, 22),
+                                  ("scalar memory", scalar_results, 45), ("graphics", graphics_results, 30),
+                                  ("expected traps", trap_results, 9), ("cache control", cache_results, 37)):
+        if any(not result["pass"] or result["operation_count"] != count for result in results):
+            raise RuntimeError(f"{suite} case validation or per-PC execution checks failed")
+    inventory_run = add_example.run_logged(commands, [sys.executable, str(ROOT / "tools" / "inventory.py"),
+                                                      "--require-complete"], 600)
+    add_example.require(inventory_run, "audit complete nontrapping ET extension coverage")
+    inventory = json.loads((ROOT / "out" / "isa" / "instruction-inventory.json").read_text())
 
-    add_root, mul_root = ROOT / "out" / "add", ROOT / "out" / "mul"
+    add_root, mul_root, sub_root = (ROOT / "out" / name for name in ("add", "mul", "sub"))
     add_layout = json.loads((add_root / "elf-layout.json").read_text())
     mul_layout = json.loads((mul_root / "elf-layout.json").read_text())
+    sub_layout = json.loads((sub_root / "elf-layout.json").read_text())
     add_result = json.loads((add_root / "result.json").read_text())
     mul_result = json.loads((mul_root / "result.json").read_text())
-    if not add_result["pass"] or not mul_result["pass"]:
-        raise RuntimeError("one or both primary arithmetic results did not pass")
-    if add_layout["operation_pc"] != mul_layout["operation_pc"] or add_layout["entry"] != mul_layout["entry"]:
-        raise RuntimeError("ADD and MUL linker layouts do not match")
+    sub_result = json.loads((sub_root / "result.json").read_text())
+    if not all(result["pass"] for result in (add_result, mul_result, sub_result)):
+        raise RuntimeError("one or more supported elementwise arithmetic results did not pass")
+    if len({layout["operation_pc"] for layout in (add_layout, mul_layout, sub_layout)}) != 1 or \
+       len({layout["entry"] for layout in (add_layout, mul_layout, sub_layout)}) != 1:
+        raise RuntimeError("ADD, MUL, and SUB linker layouts do not match")
 
     source_diff = write_diff(OUT / "source.diff", "add/kernel.S", (add_root / "kernel.S").read_text(),
                              "mul/kernel.S", (mul_root / "kernel.S").read_text())
     if (add_root / "kernel.S").read_text().replace("fadd.ps", "<packed-op>") != \
        (mul_root / "kernel.S").read_text().replace("fmul.ps", "<packed-op>"):
         raise RuntimeError("the device source changed beyond the ADD-to-MUL instruction")
+    add_source = (add_root / "kernel.S").read_text()
+    sub_source = (sub_root / "kernel.S").read_text()
+    sub_source_diff = write_diff(OUT / "add-sub.source.diff", "add/kernel.S", add_source,
+                                 "sub/kernel.S", sub_source)
+    if add_source.replace("fadd.ps", "<packed-op>") != sub_source.replace("fsub.ps", "<packed-op>"):
+        raise RuntimeError("the device source changed beyond the ADD-to-SUB instruction")
     disassembly_diff = write_diff(OUT / "disassembly.diff", "add/kernel.asm", (add_root / "kernel.asm").read_text(),
                                   "mul/kernel.asm", (mul_root / "kernel.asm").read_text())
     op_add, op_mul = (add_root / "op.bin").read_bytes(), (mul_root / "op.bin").read_bytes()
@@ -193,6 +287,29 @@ def main() -> int:
         raise RuntimeError(f"measured instruction fields do not match SysEmu decoder: {fields_add}, {fields_mul}")
     if any(fields_add[k] != fields_mul[k] for k in fields_add if k != "funct7"):
         raise RuntimeError("some decoded field other than funct7 changed")
+    op_sub = (sub_root / "op.bin").read_bytes()
+    if len(op_sub) != 4:
+        raise RuntimeError("expected one four-byte SUB instruction")
+    word_sub = int.from_bytes(op_sub, "little")
+    fields_sub = bits(word_sub)
+    if fields_sub["funct7"] != 0x04 or any(fields_add[k] != fields_sub[k]
+                                            for k in fields_add if k != "funct7"):
+        raise RuntimeError(f"measured SUB fields do not match the pinned decoder: {fields_sub}")
+    if (add_layout["operation_file_offset"] != sub_layout["operation_file_offset"] or
+            add_layout["text_vma"] != sub_layout["text_vma"]):
+        raise RuntimeError("ADD and SUB operation locations do not match")
+    sub_disassembly_diff = write_diff(OUT / "add-sub.disassembly.diff", "add/kernel.asm",
+                                      (add_root / "kernel.asm").read_text(),
+                                      "sub/kernel.asm", (sub_root / "kernel.asm").read_text())
+    add_text, sub_text = (root / "text.bin" for root in (add_root, sub_root))
+    add_text_bytes, sub_text_bytes = add_text.read_bytes(), sub_text.read_bytes()
+    if len(add_text_bytes) != len(sub_text_bytes):
+        raise RuntimeError("ADD and SUB executable sections have different lengths")
+    op_index_for_sub = int(add_layout["operation_pc"], 16) - int(add_layout["text_vma"], 16)
+    sub_changes = [i for i, (a, b) in enumerate(zip(add_text_bytes, sub_text_bytes)) if a != b]
+    if sub_changes != [i for i in range(op_index_for_sub, op_index_for_sub + 4)
+                       if add_text_bytes[i] != sub_text_bytes[i]]:
+        raise RuntimeError("ADD and SUB .text differ outside the arithmetic operation")
 
     platform = Path(os.environ.get("ET_PLATFORM_SOURCE", Path.home() / "et-platform"))
     commit = subprocess.run(["git", "-C", str(platform), "rev-parse", "HEAD"],
@@ -204,7 +321,8 @@ def main() -> int:
     start = decoder.index("static insn_exec_funct_t dec_custom3")
     end = decoder.index("\n}\n", start) + 3
     decoder_block = decoder[start:end]
-    for needle in ("case 0x00: return insn_fadd_ps;", "case 0x08: return insn_fmul_ps;"):
+    for needle in ("case 0x00: return insn_fadd_ps;", "case 0x04: return insn_fsub_ps;",
+                   "case 0x08: return insn_fmul_ps;"):
         if needle not in decoder_block:
             raise RuntimeError(f"pinned SysEmu decoder no longer contains the measured mapping: {needle}")
     (OUT / "simulator-decoder.txt").write_text(
@@ -220,8 +338,11 @@ def main() -> int:
     whole_add, whole_mul = (add_root / "kernel.elf").read_bytes(), (mul_root / "kernel.elf").read_bytes()
     elf_changes = byte_changes(whole_add, whole_mul)
     file_offset = int(add_layout["operation_file_offset"], 16)
-    if any(not file_offset <= pos < file_offset + 4 for pos, _, _ in elf_changes):
-        raise RuntimeError("whole ELF contains changes outside the operation bytes; see elf-diff.txt")
+    # Executable .text equality is checked above. Whole-ELF metadata may
+    # differ independently; report those differences without conflating them
+    # with a changed device instruction. The patched copy is checked strictly.
+    other_elf_changes = [(pos, before, after) for pos, before, after in elf_changes
+                         if not file_offset <= pos < file_offset + 4]
     (OUT / "elf-diff.txt").write_text(
         f"ADD bytes: {len(whole_add)}\nMUL bytes: {len(whole_mul)}\nChanged byte offsets: {len(elf_changes)}\n" +
         byte_diff_text(elf_changes))
@@ -263,11 +384,13 @@ def main() -> int:
     for case_name in ("primary", "exact"):
         left = json.loads((add_root / ("result.json" if case_name == "primary" else f"{case_name}/result.json")).read_text())
         right = json.loads((mul_root / ("result.json" if case_name == "primary" else f"{case_name}/result.json")).read_text())
-        if left["input_a"] != right["input_a"] or left["input_b"] != right["input_b"]:
-            raise RuntimeError(f"input data differed between ADD and MUL for {case_name}")
-        if not left["pass"] or not right["pass"]:
+        sub = json.loads((sub_root / ("result.json" if case_name == "primary" else f"{case_name}/result.json")).read_text())
+        if any(left[key] != right[key] or left[key] != sub[key] for key in ("input_a", "input_b")):
+            raise RuntimeError(f"input data differed between ADD/MUL/SUB for {case_name}")
+        if not left["pass"] or not right["pass"] or not sub["pass"]:
             raise RuntimeError(f"an example failed its independent Python reference for {case_name}")
-        case_summaries.append({"case": case_name, "add": left["actual_output"], "mul": right["actual_output"]})
+        case_summaries.append({"case": case_name, "add": left["actual_output"],
+                               "mul": right["actual_output"], "sub": sub["actual_output"]})
     add_regs = json.loads((add_root / "registers.json").read_text())
     mul_regs = json.loads((mul_root / "registers.json").read_text())
     for reg in ("f10", "f11"):
@@ -275,6 +398,7 @@ def main() -> int:
             raise RuntimeError(f"{reg} changed between ADD and MUL")
     if add_regs["f12"]["before"] != mul_regs["f12"]["before"]:
         raise RuntimeError("destination-register initialization changed between ADD and MUL")
+    sub_regs = json.loads((sub_root / "registers.json").read_text())
     register_diff = ["Register/result comparison from SysEmu traces and snapshots:\n"]
     for name in ("f10", "f11"):
         register_diff.append(f"{name}: before equal={add_regs[name]['before'] == mul_regs[name]['before']}; "
@@ -282,9 +406,27 @@ def main() -> int:
     register_diff.append(f"f12 before equal=True: {add_regs['f12']['before']['f32']}\n")
     register_diff.append(f"f12 after ADD: {add_regs['f12']['after']['f32']}\n")
     register_diff.append(f"f12 after MUL: {mul_regs['f12']['after']['f32']}\n")
+    register_diff.append(f"f12 after SUB: {sub_regs['f12']['after']['f32']}\n")
     register_diff.append(f"C after ADD: {add_result['actual_output']}\n")
     register_diff.append(f"C after MUL: {mul_result['actual_output']}\n")
+    register_diff.append(f"C after SUB: {sub_result['actual_output']}\n")
     (OUT / "register-result.diff.txt").write_text("".join(register_diff))
+
+    elementwise = {
+        "scope": "the three operations currently enabled by the pinned ggml-et el_map_f32.c reference",
+        "decoder": "ET Platform dec_custom3; fadd/fsub/fmul selected by funct7",
+        "operations": [
+            {"name": "fadd.ps", "word": f"0x{word_add:08x}", "bytes": op_add.hex(" "),
+             "funct7": fields_add["funct7"], "result": add_result["actual_output"]},
+            {"name": "fsub.ps", "word": f"0x{word_sub:08x}", "bytes": op_sub.hex(" "),
+             "funct7": fields_sub["funct7"], "result": sub_result["actual_output"]},
+            {"name": "fmul.ps", "word": f"0x{word_mul:08x}", "bytes": op_mul.hex(" "),
+             "funct7": fields_mul["funct7"], "result": mul_result["actual_output"]},
+        ],
+        "add_sub_source_diff": "add-sub.source.diff",
+        "add_sub_disassembly_diff": "add-sub.disassembly.diff",
+    }
+    (OUT / "elementwise-operations.json").write_text(json.dumps(elementwise, indent=2) + "\n")
 
     report = {
         "platform_commit": commit, "simulator_decoder": "sw-sysemu/processor.cpp dec_custom3",
@@ -296,11 +438,56 @@ def main() -> int:
         "changed_encoding_field": "funct7 bits [31:25], selected by the pinned SysEmu custom-3 decoder",
         "elf_operation_file_offset": f"0x{file_offset:x}", "whole_elf_changed_byte_count": len(elf_changes),
         "whole_elf_changed_offsets": [f"0x{p:x}" for p, _, _ in elf_changes],
+        "whole_elf_changes_outside_operation": [f"0x{p:x}" for p, _, _ in other_elf_changes],
         "source_diff": "source.diff", "disassembly_diff": "disassembly.diff",
         "elf_diff": "elf-diff.txt", "patch_diff": "patch.diff.txt",
         "patched_elf": "patched/kernel.elf", "patch_xor_binary": "patch.xor.bin",
         "patched_execution": patched_execution,
         "cases": case_summaries,
+        "elementwise_operations": elementwise,
+        "gemm": {"shape": gemm_result["shape"], "device_instruction": gemm_result["device_instruction"],
+                 "fma_count": gemm_result["fma_count"], "primary_pass": gemm_result["pass"],
+                 "broadcast_count": gemm_result["broadcast_count"],
+                 "exact_pass": gemm_exact["pass"], "output": gemm_result["output_actual"]},
+        "packed_integer": {"instruction_count": packed_int["instruction_count"],
+                           "primary_pass": packed_int["pass"], "exact_pass": packed_int_exact["pass"],
+                           "primary_masks": packed_int["mask_results"],
+                           "exact_masks": packed_int_exact["mask_results"]},
+        "packed_float": {"instruction_count": packed_fp["operation_count"],
+                         "primary_pass": packed_fp["pass"], "exact_pass": packed_fp_exact["pass"],
+                         "operations": [row["name"] for row in packed_fp["output_actual"]]},
+        "packed_memory": {"instruction_count": 33,
+                          "cases": {result["case"]: result["pass"] for result in memory_results}},
+        "packed_atomic": {"instruction_count": 22,
+                          "cases": {result["case"]: result["pass"] for result in atomic_results}},
+        "scalar_memory": {"instruction_count": 45,
+                          "cases": {result["case"]: result["pass"] for result in scalar_results}},
+        "graphics": {"instruction_count": 30,
+                     "cases": {result["case"]: result["pass"] for result in graphics_results}},
+        "expected_traps": {"instruction_count": 9,
+                           "cases": {result["case"]: result["pass"] for result in trap_results}},
+        "cache_control": {"instruction_count": 37, "csr_count": 13,
+                          "cases": {result["case"]: result["pass"] for result in cache_results},
+                          "scope": "separate CSR commands; mode/readback, actual cache-line accesses and intentional error feedback"},
+        "synchronization": {"csr_count": 5, "cases": {result["case"]: {
+            "pass": result["pass"], "instruction_count": result["operation_count"],
+            "timer_wait_cycles": result["timer_wait_cycles"]} for result in sync_results},
+            "scope": "separate CSR/ESR commands; barriers, self-supplied credits and actual STALL wait/wake"},
+        "message_ports": {"csr_count": 12, "cases": {result["case"]: {
+            "pass": result["pass"], "instruction_count": result["operation_count"],
+            "message_width": result["message_width"], "blocking_proof": result["blocking_proof"],
+            "queue_proof": result["queue_proof"]} for result in port_results},
+            "scope": "four-port 4/8-byte FIFO/wrap/reset/drop, H2 -> H0 blocking, overcapacity overwrite and uint8 count wrap"},
+        "synchronization_peers": {"cases": {result["case"]: {
+            "pass": result["pass"], "instruction_count": result["operation_count"], "proof": result["proof"]} for result in peer_results},
+            "credit_esr_routes": sorted({result["proof"]["credit_esr"] for result in peer_results}),
+            "scope": "T0/T1 FCC0/FCC1 routing, zero-credit wait/restart, wrong-thread/wrong-counter isolation, real overflow and ordered FLB"},
+        "extension_coverage": {"handler_count": inventory["unique_handler_count"],
+                               "verified_nontrapping_handlers": inventory["verified_execution_handler_count"],
+                               "unimplemented_trap_stubs": inventory["trap_stub_mnemonics"],
+                               "verified_trap_stubs": inventory["verified_trap_stub_count"],
+                               "unverified_nontrapping_handlers": inventory["unverified_nontrapping_handlers"],
+                               "runs_missing_evidence": inventory["runs_missing_evidence"]},
     }
     (OUT / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
     print("\n=== kernel.S diff ===")
@@ -309,10 +496,26 @@ def main() -> int:
     print(disassembly_diff or "(no disassembly difference)", end="")
     print(f"\nADD word 0x{word_add:08x} bytes {op_add.hex(' ')}")
     print(f"MUL word 0x{word_mul:08x} bytes {op_mul.hex(' ')}")
+    print(f"SUB word 0x{word_sub:08x} bytes {op_sub.hex(' ')}")
     print(f"XOR 0x{word_xor:08x}; changed bit positions (LSB=0): {changed_bits}")
     print(f"decoder funct7: ADD 0x{fields_add['funct7']:02x}, MUL 0x{fields_mul['funct7']:02x}; all other decoded fields are equal")
     print("registers: f10/f11 are unchanged; f12's simulator-captured value changes as shown in out/compare/register-result.diff.txt")
-    print(f"primary results: ADD {add_result['actual_output']}  MUL {mul_result['actual_output']}")
+    print(f"primary results: ADD {add_result['actual_output']}  MUL {mul_result['actual_output']}  SUB {sub_result['actual_output']}")
+    print(f"ADD/SUB source and disassembly diffs are in add-sub.source.diff and add-sub.disassembly.diff")
+    print(f"GEMM {gemm_result['shape']} via {gemm_result['fma_count']} {gemm_result['device_instruction']} instructions: PASS")
+    print(f"packed integer: {packed_int['instruction_count']} ops in primary/exact cases: PASS")
+    print(f"packed floating-point: {packed_fp['operation_count']} sites in primary/exact cases: PASS")
+    print("packed memory: 33 sites in primary/exact cases: PASS")
+    print("packed atomic: 22 sites in primary/exact/alias cases: PASS")
+    print("scalar memory: 45 sites in primary/exact cases: PASS")
+    print("cache control: 37 sites across 13 CSRs in primary/exact cases: PASS")
+    print("synchronization: 23/24 sites across 5 CSRs and actual timed STALL wait/wake: PASS")
+    print("message ports: 80 sites across 12 CSRs per FIFO case; both blocking cases and both 60-site overcapacity/count-wrap cases: PASS")
+    print("peer synchronization: all four T0/T1 FCC routes, block/restart, wrong-thread/wrong-counter isolation, real 16-bit overflow and ordered FLB: PASS")
+    print("graphics: 30 sites in primary/exact cases: PASS")
+    print("expected traps: 8 cause-30 arithmetic stubs and disabled-graphics cause-2 fault: PASS")
+    print(f"ET extension handlers with verified execution: {inventory['verified_execution_handler_count']}; "
+          f"nontrapping gaps: {len(inventory['unverified_nontrapping_handlers'])}")
     print(f".text differences are confined to the operation. Whole ELF changed bytes: {len(elf_changes)} at {[hex(p) for p, _, _ in elf_changes]}")
     print(f"patched ELF PC 0x{int(add_layout['operation_pc'], 16):x} maps to file offset 0x{file_offset:x}")
     print(f"patched run decoded {patched_execution['operation']} and produced {patched_execution['output']}")

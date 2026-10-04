@@ -162,7 +162,7 @@ if [[ "$KIND" == podman ]]; then
     [[ $RECORD_STATUS -eq 0 ]] || exit 1
     record probe-cleanup 30 "${EXEC[@]}" rm -rf "$STAGE"
 else
-    record assembler-probe 60 bash -lc 'cd "$1" && "$2as" --march=rv64imfc -mabi=lp64f -o probe.o probe.S && "$2objdump" -d probe.o > probe.asm && cat probe.asm' _ "$OUT" "$TOOL_PREFIX"
+    record assembler-probe 60 bash -lc 'cd "$1" && "$2as" --march=rv64imfc -mabi=lp64f -o probe.o toolchain-probe.S && "$2objdump" -d probe.o > probe.asm && cat probe.asm' _ "$OUT" "$TOOL_PREFIX"
 fi
 [[ $RECORD_STATUS -eq 0 ]] || exit 1
 grep -q 'fadd.ps' "$OUT/assembler-probe.log" && grep -q 'fmul.ps' "$OUT/assembler-probe.log" || {

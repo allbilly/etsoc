@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble, run, and report one ET-SOC1 packed-float MUL on real SysEmu."""
+"""Assemble, run, and report one ET-SOC1 packed-float SUB on real SysEmu."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "out" / "mul"
+OUT = ROOT / "out" / "sub"
 HOST_TIMEOUT = 120
 SIM_TIMEOUT = 90
 SIM_CYCLES = 10_000
@@ -125,7 +125,7 @@ def run_logged(log: Path, argv: list[str], timeout: int = HOST_TIMEOUT) -> subpr
 
 def require(result: subprocess.CompletedProcess[str], what: str) -> None:
     if result.returncode != 0:
-        raise RuntimeError(f"{what} failed with exit status {result.returncode}; see out/mul/commands.log and trace.log")
+        raise RuntimeError(f"{what} failed with exit status {result.returncode}; see out/sub/commands.log and trace.log")
 
 
 def asm_float(value: float) -> str:
@@ -179,7 +179,7 @@ capture_fcsr_before:
 
 .globl operation
 operation:
-    fmul.ps f12, f10, f11, rne
+    fsub.ps f12, f10, f11, rne
 
 .globl capture_fcsr_after
 capture_fcsr_after:
@@ -352,7 +352,7 @@ def state_value(event: dict[str, object], name: str) -> int:
 def main() -> int:
     selected = sys.argv[1:] or ["primary", "exact"]
     if any(name not in CASES for name in selected):
-        raise SystemExit("usage: python3 examples/add.py [primary|exact ...]")
+        raise SystemExit("usage: python3 examples/sub.py [primary|exact ...]")
     OUT.mkdir(parents=True, exist_ok=True)
     env = runtime()
     all_ok = True
@@ -365,7 +365,7 @@ def main() -> int:
         (case_dir / "link.ld").write_text(LINKER)
 
         run_id = uuid.uuid4().hex[:10]
-        stage = f"/tmp/etsoc1-mul-{run_id}"
+        stage = f"/tmp/etsoc1-add-{run_id}"
         is_container = env["kind"] == "podman"
         if is_container:
             podman = shutil.which("podman") or "podman"
@@ -434,8 +434,8 @@ def main() -> int:
         op_word = int.from_bytes(op_bytes, "little")
         decoded = [line.strip() for line in (case_dir / "kernel.asm").read_text().splitlines()
                    if re.search(rf"\b{op_pc:x}:\s", line)]
-        if len(decoded) != 1 or "fmul.ps" not in decoded[0]:
-            raise RuntimeError(f"pinned objdump did not decode the operation as fmul.ps: {decoded}")
+        if len(decoded) != 1 or "fsub.ps" not in decoded[0]:
+            raise RuntimeError(f"pinned objdump did not decode the operation as fsub.ps: {decoded}")
         dump_addr = symbols["__monitor_start"]
         dump_size = symbols["__monitor_end"] - dump_addr
         (case_dir / "elf-layout.json").write_text(json.dumps({
@@ -477,7 +477,7 @@ def main() -> int:
             raise RuntimeError("unexpected trap/exception text appears in the SysEmu trace")
         events, reg_events = trace_events(trace)
         park = event_at(events, symbols["park"], "wfi")
-        operation = event_at(events, op_pc, "fmul.ps")
+        operation = event_at(events, op_pc, "fsub.ps")
         if operation["word"] != op_word:
             raise RuntimeError("the executed operation word differs from the assembled ELF")
         seed = event_at(events, symbols["seed_load"], "flw.ps")
@@ -519,7 +519,7 @@ def main() -> int:
             raise RuntimeError("the operation changed a source register")
         if result_f12 != post_regs["f12"] or actual_bytes != struct.pack("<8I", *result_f12):
             raise RuntimeError("the operation write, register snapshot, and output memory disagree")
-        expected = tuple(x * y for x, y in zip(a, b))
+        expected = tuple(x - y for x, y in zip(a, b))
         expected_bytes = pack_floats(expected)
         complete = struct.unpack_from("<I", output, offset("completion"))[0]
         trap_marker = struct.unpack_from("<I", output, offset("trap_marker"))[0]
@@ -559,7 +559,7 @@ def main() -> int:
         }
         (case_dir / "registers.json").write_text(json.dumps(registers, indent=2) + "\n")
         (case_dir / "result.json").write_text(json.dumps({
-            "case": case_name, "operation": "fmul.ps", "input_a": a, "input_b": b,
+            "case": case_name, "operation": "fsub.ps", "input_a": a, "input_b": b,
             "actual_output_bytes": actual_bytes.hex(" "),
             "actual_output": struct.unpack("<8f", actual_bytes), "expected_output": expected,
             "initial_output_sentinel_bytes": initial_c.hex(" "),
@@ -567,7 +567,7 @@ def main() -> int:
             "trap_cause": trap_cause, "pass": passed,
         }, indent=2) + "\n")
 
-        print(f"\nMUL {case_name}: entry=0x{entry:x} hart={operation['hart']} op_pc=0x{op_pc:x}")
+        print(f"\nSUB {case_name}: entry=0x{entry:x} hart={operation['hart']} op_pc=0x{op_pc:x}")
         print(f"  instruction: {decoded[0]}")
         print(f"  memory-order bytes: {op_bytes.hex(' ')}  decoded word: 0x{op_word:08x}")
         print(f"  cycle={operation['cycle']} mask=0x{mask:02x} "
@@ -588,5 +588,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"mul.py: {exc}", file=sys.stderr)
+        print(f"sub.py: {exc}", file=sys.stderr)
         raise SystemExit(1)

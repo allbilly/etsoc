@@ -66,7 +66,6 @@ def runtime() -> dict[str, str]:
                                    simulator=f"{prefix}/bin/sys_emu")
                         return env
         raise RuntimeError("The recorded ET installation is unavailable or incompatible; rerun ./setup.sh.")
-        return env
 
     prefix = os.environ.get("ET_PREFIX", "/opt/et")
     if Path(prefix, "bin", "sys_emu").is_file():
@@ -140,6 +139,7 @@ def assembly(a: tuple[float, ...], b: tuple[float, ...]) -> str:
     # stack, and a trap target. It does not copy the upstream register-clear
     # loop or validation-CSR bookkeeping.
     return f"""# SPDX-License-Identifier: Apache-2.0
+# Startup provenance: Copyright (c) 2025 Ainekko, Co.
 # ET-SOC1 minion startup conventions adapted from aifoundry-org/et-platform
 # sw-sysemu/examples/common/boot.S, pinned by README.md.
 .option push
@@ -338,6 +338,8 @@ def event_at(events: list[dict[str, object]], pc: int, begins: str = "") -> dict
     matches = [e for e in events if e["pc"] == pc and str(e["disassembly"]).startswith(begins)]
     if len(matches) != 1:
         raise RuntimeError(f"expected one traced instruction {begins!r} at 0x{pc:x}, found {len(matches)}")
+    if matches[0]["hart"] != "H0 S0:N0:C0:T0":
+        raise RuntimeError(f"unexpected hart at 0x{pc:x}: {matches[0]['hart']}")
     return matches[0]
 
 
@@ -476,6 +478,8 @@ def main() -> int:
         events, reg_events = trace_events(trace)
         park = event_at(events, symbols["park"], "wfi")
         operation = event_at(events, op_pc, "fadd.ps")
+        if operation["word"] != op_word:
+            raise RuntimeError("the executed operation word differs from the assembled ELF")
         seed = event_at(events, symbols["seed_load"], "flw.ps")
         fcsr_before = event_at(events, symbols["capture_fcsr_before"], "csrr")
         fcsr_after = event_at(events, symbols["capture_fcsr_after"], "csrr")
@@ -511,6 +515,10 @@ def main() -> int:
                     "<8I", output, symbols[f"snapshot_f{n}"] - dump_addr):
                 raise RuntimeError(f"SysEmu trace and device snapshot disagree for f{n}")
         actual_bytes = output[offset("result_c"):offset("result_c") + 32]
+        if source_a != post_regs["f10"] or source_b != post_regs["f11"]:
+            raise RuntimeError("the operation changed a source register")
+        if result_f12 != post_regs["f12"] or actual_bytes != struct.pack("<8I", *result_f12):
+            raise RuntimeError("the operation write, register snapshot, and output memory disagree")
         expected = tuple(x + y for x, y in zip(a, b))
         expected_bytes = pack_floats(expected)
         complete = struct.unpack_from("<I", output, offset("completion"))[0]
@@ -523,6 +531,9 @@ def main() -> int:
         mask = operation["state"].get("m0::", mask_event["state"].get("m0:="))
         if mask != 0xFF:
             raise RuntimeError(f"active lane mask was not 0xff: {mask!r}")
+        mask_after = state_value(event_at(events, symbols["capture_f12_after"], "fsw.ps"), "m0::")
+        if mask_after != 0xFF:
+            raise RuntimeError(f"post-operation lane mask was not 0xff: {mask_after!r}")
 
         registers = {
             "source": "SysEmu -l register events plus device-side fsw.ps snapshots; all events are H0/S0/N0/C0/T0",
@@ -531,7 +542,9 @@ def main() -> int:
             "f10": {"before": lane_report(source_a), "after": lane_report(post_regs["f10"])},
             "f11": {"before": lane_report(source_b), "after": lane_report(post_regs["f11"])},
             "f12": {"before": lane_report(seed_f12), "after": lane_report(result_f12)},
-            "active_mask": {"before_operation": "0x%02x" % mask, "after_operation": "0x%02x" % mask,
+            "active_mask": {"before_operation": "0x%02x" % mask, "after_operation": "0x%02x" % mask_after,
+                            "operation_read_pc": f"0x{op_pc:x}",
+                            "after_read_pc": f"0x{symbols['capture_f12_after']:x}",
                             "evidence_pc": f"0x{int(mask_event['pc']):x}", "mova_event": mask_event["disassembly"]},
             "mstatus": {"before": f"0x{state_value(mstatus_before, 'mstatus'):x}",
                         "after": f"0x{state_value(mstatus_after, 'mstatus'):x}"},
