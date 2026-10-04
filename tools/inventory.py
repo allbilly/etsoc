@@ -1592,7 +1592,219 @@ def branch_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], 
     return report,missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict) -> dict:
+def compressed_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Independently decode compressed selectors/fields and audit actual effects."""
+    selected={name for name,row in definitions(source_root/'sw-sysemu/insns').items()
+              if row['source'] in ('insns/c_arith.cpp','insns/c_branch.cpp','insns/c_loadstore.cpp') or name=='c_ebreak'}
+    if len(selected)!=34: raise RuntimeError('pinned compressed handler inventory changed')
+    def sign(value,width):
+        value &= (1<<width)-1
+        return value-(1<<width) if value>>(width-1) else value
+    def decode(w):
+        # Literal selectors and bit fields from processor.cpp and insn.h.
+        q,f=w&3,w>>13; rd=w>>7&31; rs2=w>>2&31; rp=8+(w>>7&7); sp=8+(w>>2&7)
+        imm=sign((w>>2&31)|(w>>7&32),6); shift=(w>>2&31)|(w>>7&32)
+        if q==0:
+            name=('addi4spn' if w>>5&255 else 'reserved') if f==0 and w else 'illegal' if w==0 else {2:'lw',3:'ld',6:'sw',7:'sd'}.get(f,'reserved')
+        elif q==1:
+            if f==0: name='addi'
+            elif f==1: name='addiw' if rd else 'reserved'
+            elif f==2: name='li'
+            elif f==3: name=('addi16sp' if rd==2 else 'lui') if imm else 'reserved'
+            elif f==4:
+                sub=w>>10&3
+                name=('srli','srai','andi')[sub] if sub<3 else ('sub','xor','or','and','subw','addw','reserved','reserved')[(w>>12&1)*4+(w>>5&3)]
+            else: name={5:'j',6:'beqz',7:'bnez'}[f]
+        elif q==2:
+            if f==4: name=('reserved','mv','jr','mv','ebreak','add','jalr','add')[(w>>12&1)*4+2*bool(rd)+bool(rs2)]
+            else: name={0:'slli',2:'lwsp' if rd else 'reserved',3:'ldsp' if rd else 'reserved',6:'swsp',7:'sdsp'}.get(f,'reserved')
+        else: raise RuntimeError('not a 16-bit compressed instruction')
+        handler='c_'+name; base=None; source=None; dest=None; width=0; kind='arithmetic'
+        if name in ('illegal','reserved','ebreak'): kind='fault'; imm=0
+        elif name in ('j','jr','jalr','beqz','bnez'):
+            kind='branch';base=rp if name in ('beqz','bnez') else rd if name in ('jr','jalr') else None
+            dest=1 if name=='jalr' else None
+            if name=='j': imm=sign((w>>2&0xE)|(w>>7&0x10)|(w<<3&0x20)|(w<<1&0x80)|(w<<2&0x400)|(w>>1&0xB40),12)
+            elif name in ('beqz','bnez'): imm=sign((w>>2&6)|(w>>7&0x18)|(w<<3&0x20)|(w<<1&0xC0)|(w>>4&0x100),9)
+            else: imm=0
+        elif name in ('lw','ld','sw','sd','lwsp','ldsp','swsp','sdsp'):
+            kind='load' if name.startswith('l') else 'store';width=32 if name.startswith(('lw','sw')) else 64
+            base=2 if name.endswith('sp') else rp
+            dest=(rd if name.endswith('sp') else sp) if kind=='load' else None
+            source=(rs2 if name.endswith('sp') else sp) if kind=='store' else None
+            if name=='lwsp': imm=(w>>2&0x1C)|(w>>7&0x20)|(w<<4&0xC0)
+            elif name=='ldsp': imm=(w>>2&0x18)|(w>>7&0x20)|(w<<4&0x1C0)
+            elif name=='swsp': imm=(w>>7&0x3C)|(w>>1&0xC0)
+            elif name=='sdsp': imm=(w>>7&0x38)|(w>>1&0x1C0)
+            elif width==32: imm=(w>>4&4)|(w>>7&0x38)|(w<<1&0x40)
+            else: imm=(w>>7&0x38)|(w<<1&0xC0)
+        elif name=='addi4spn':
+            dest=sp;base=2;imm=(w>>4&4)|(w>>2&8)|(w>>7&0x30)|(w>>1&0x3C0)
+        elif name=='addi16sp':
+            dest=base=2;imm=sign((w>>2&0x10)|(w<<3&0x20)|(w<<1&0x40)|(w<<4&0x180)|(w>>3&0x200),10)
+        elif name=='lui': dest=rd;imm=sign((w<<10&0x1F000)|(w<<5&0x20000),18)
+        elif name in ('add','mv'): dest=rd;base=rd if name=='add' else None;source=rs2;imm=0
+        elif name in ('sub','xor','or','and','subw','addw'): dest=base=rp;source=sp;imm=0
+        elif name in ('srli','srai','andi'): dest=base=rp;imm=imm if name=='andi' else shift
+        else: dest=rd;base=None if name=='li' else rd;imm=shift if name=='slli' else imm
+        return dict(handler=handler,kind=kind,rd=dest,rs1=base,rs2=source,immediate=imm,width=width)
+    runs,missing=[],[]
+    for case in ('primary','exact'):
+        directory=ROOT/'out/compressed'/('' if case=='primary' else case)
+        required=('result.json','registers.json','operations.json','elf-layout.json','kernel.S','link.ld','kernel.elf',
+                  'kernel.asm','text.bin','operations.bin','op.bin','elf-inspection.txt','symbols.txt','commands.log','prestart.bin','output.bin','expected.bin')
+        run_name=str(directory.relative_to(ROOT))
+        if any(not (directory/n).is_file() for n in required): missing.append(run_name); continue
+        result,registers,sites,layout=(json.loads((directory/n).read_text()) for n in ('result.json','registers.json','operations.json','elf-layout.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case']!=case or (result['operation_count'],result['handler_count'],result['trap_count'])!=(36,34,3): raise RuntimeError('compressed result/count failure')
+        if len(sites)!=36 or len(registers['operations'])!=36 or result['operations']!=registers['operations'] or {s['handler'] for s in sites}!=selected: raise RuntimeError('compressed site/handler coverage differs')
+        elf,pre,memory=((directory/n).read_bytes() for n in ('kernel.elf','prestart.bin','output.bin'))
+        if elf[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',elf,18)[0]!=243: raise RuntimeError('compressed ELF architecture differs')
+        entry,phoff,shoff=struct.unpack_from('<3Q',elf,24); phsize,phcount,shsize,shcount,strings=struct.unpack_from('<5H',elf,54)
+        segments=[struct.unpack_from('<II6Q',elf,phoff+i*phsize) for i in range(phcount)]
+        sections=[struct.unpack_from('<II4QII2Q',elf,shoff+i*shsize) for i in range(shcount)]
+        names=elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections={names[s[0]:].split(b'\0',1)[0].decode():s for s in sections}
+        if [n for n,s in sections.items() if s[2]&4 and s[5]]!=['.text'] or entry!=int(layout['entry'],16): raise RuntimeError('compressed section/entry differs')
+        text=sections['.text']
+        if (directory/'text.bin').read_bytes()!=elf[text[4]:text[4]+text[5]]: raise RuntimeError('compressed text extraction differs')
+        start,size=int(layout['monitor_address'],16),layout['monitor_size']
+        maps=[p[2]+start-p[3] for p in segments if p[0]==1 and p[3]<=start and start+size<=p[3]+p[5]]
+        if len(maps)!=1 or len(pre)!=size or len(memory)!=size or pre!=elf[maps[0]:maps[0]+size]: raise RuntimeError('compressed initial guards/inputs differ from ELF')
+        syms={s[2]:int(s[0],16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s:=line.split())==3}
+        trace=(directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace: raise RuntimeError('compressed execution did not finish normally')
+        events,current=[],None
+        for line in trace.splitlines():
+            m=re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$',line)
+            if m: current=dict(hart=m[1],pc=int(m[2],16),word=int(m[3],16),decoded=m[4],regs={},memory=[]);events.append(current)
+            elif current is not None:
+                m=re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)',line)
+                if m: current['regs'][m[1]+m[2]]=int(m[3],16)
+                m=re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)',line)
+                if m: current['memory'].append((int(m[1]),int(m[2],16),m[3],int(m[4],16)))
+        if any(e['hart']!='H0 S0:N0:C0:T0' for e in events): raise RuntimeError('compressed wrong executing hart')
+        by_pc={}
+        for index,e in enumerate(events): by_pc.setdefault(e['pc'],[]).append((index,e))
+        def event(name):
+            found=by_pc.get(syms[name],[])
+            if len(found)!=1: raise RuntimeError('compressed missing/repeated site '+name)
+            return found[0][1]
+        state,before={},{};pcs={int(s['pc'],16) for s in sites}
+        for e in events:
+            if e['pc'] in pcs: before[e['pc']]=dict(state)
+            for key,value in e['regs'].items():
+                if key.endswith('='): state[key[:-1]]=value
+        traps=re.findall(r'\[(H\d+ S\d+:N\d+:C\d+:T\d+)\].*Trapping to M-mode with cause 0x([0-9a-f]+) and tval 0x([0-9a-f]+)',trace)
+        captures={c:[e for e in events if e['pc']==syms['capture_'+c]] for c in ('mcause','mepc','mtval','mstatus')}
+        expected,assembled,fault_index,outcomes=bytearray(pre),[],0,{}
+        aa,bb=(0x800000017FFFFFFB,0x7FFFFFFFFFFFFFED) if case=='primary' else (0x7FFFFFFE80000005,0x8000000000000003)
+        payload=0xFEDCBA9889ABCDEF if case=='primary' else 0x0123456776543210
+        for site,row in zip(sites,registers['operations']):
+            name,pc=site['name'],int(site['pc'],16);op=event('op_'+name)
+            offsets=[p[2]+pc-p[3] for p in segments if p[0]==1 and p[1]&1 and p[3]<=pc and pc+2<=p[3]+p[5]]
+            raw=bytes.fromhex(site['bytes_memory_order']);w=int.from_bytes(raw,'little');assembled.append(raw)
+            if len(raw)!=2 or len(offsets)!=1 or elf[offsets[0]:offsets[0]+2]!=raw or offsets[0]!=int(site['file_offset'],16) or w!=int(site['word'],16) or w!=op['word']: raise RuntimeError('compressed operation PC/ELF/trace word differs')
+            d=decode(w);h=d['handler'];kind=d['kind'];imm=d['immediate'];rd=d['rd']
+            if h!=site['handler'] or kind!=site['kind'] or d['width']!=site['width']: raise RuntimeError('compressed decoded handler/kind/width differs')
+            trace_name='illegal compressed opcode' if kind=='fault' and h!='c_ebreak' else {'c_bnez':'c.bneqz','c_sw':'c.sd'}.get(h,h.replace('_','.'))
+            if not op['decoded'].startswith(trace_name): raise RuntimeError('compressed trace label differs from decoder identity')
+            a,b=struct.unpack_from('<2Q',pre,syms['input_'+name]-start)
+            for j,reg in enumerate(('x10','x11')):
+                load=event(('load_a_' if j==0 else 'load_b_')+name);v=(a,b)[j]
+                if load['regs'].get(reg+'=')!=v or load['memory']!=[(64,syms['input_'+name]+8*j,':',v)]: raise RuntimeError('compressed actual input load differs')
+            sp=syms['target_'+name]+32-imm if kind in ('load','store') and name.endswith('sp') else syms['__stack_top']-512
+            values=(a,b,sp,0xCAFEF00DCAFEF00D,0xCAFE);regnames=('x10','x11','x2','x1','x20');source=before[pc]
+            if tuple(source.get(r) for r in regnames)!=values: raise RuntimeError('compressed operands/seeds lack actual complete write reconstruction')
+            for reg in (d['rs1'],d['rs2']):
+                if reg is not None and op['regs'].get(f'x{reg}:')!=source.get(f'x{reg}'): raise RuntimeError('compressed source field/read differs')
+            wanted=list(values);mem=[];taken=False;fault_values=None
+            if kind=='arithmetic':
+                if (a,b)!=(aa,bb) or rd!=(2 if h=='c_addi16sp' else 10) or imm!=site['immediate']: raise RuntimeError('compressed arithmetic input/register/immediate case differs')
+                av=source.get(f'x{d["rs1"]}',0);bv=source.get(f'x{d["rs2"]}',0)
+                if h in ('c_add','c_addw'):v=av+bv
+                elif h in ('c_sub','c_subw'):v=av-bv
+                elif h=='c_xor':v=av^bv
+                elif h=='c_or':v=av|bv
+                elif h=='c_and':v=av&bv
+                elif h=='c_mv':v=bv
+                elif h in ('c_addi','c_addiw','c_addi16sp','c_addi4spn'):v=av+imm
+                elif h=='c_andi':v=av&imm
+                elif h in ('c_li','c_lui'):v=imm
+                elif h=='c_slli':v=av<<imm
+                elif h=='c_srli':v=av>>imm
+                elif h=='c_srai':v=sign(av,64)>>imm
+                else:raise RuntimeError('missing compressed arithmetic reference')
+                if h in ('c_addiw','c_addw','c_subw'):v=sign(v,32)
+                wanted[regnames.index(f'x{rd}')]=v&((1<<64)-1)
+            elif kind in ('load','store'):
+                width=d['width'];address=source[f'x{d["rs1"]}']+imm
+                if imm!=(32 if case=='primary' else 64) or imm!=site['immediate'] or address!=syms['target_'+name]+32: raise RuntimeError('compressed memory offset/base/address differs')
+                if (rd!=10 if kind=='load' else d['rs2']!=10): raise RuntimeError('compressed memory value register differs')
+                target=syms['target_'+name]-start
+                initial=bytes([0x5A])*32+(payload.to_bytes(8,'little') if kind=='load' else bytes([0x5A])*8)+bytes([0x5A])*88
+                if pre[target:target+128]!=initial or a!=(0x5AA55AA55AA55AA5 if kind=='load' else payload) or b!=(bb if name.endswith('sp') else address-imm): raise RuntimeError('compressed guarded memory/input case differs')
+                off=address-start
+                if kind=='load':
+                    v=int.from_bytes(pre[off:off+width//8],'little');mem=[(width,address,':',v)];wanted[0]=(sign(v,32) if width==32 else v)&((1<<64)-1)
+                else:
+                    v=a&((1<<width)-1);mem=[(width,address,'=',v)];expected[off:off+width//8]=v.to_bytes(width//8,'little')
+            elif kind=='branch':
+                target=syms['target_'+name];direction='forward' if case=='primary' else 'backward'
+                if (target>pc)!=(direction=='forward') or site['direction']!=direction or b!=bb: raise RuntimeError('compressed branch direction/input case differs')
+                if h in ('c_beqz','c_bnez'):
+                    if d['rs1']!=10 or a not in (0,(-3&((1<<64)-1)) if case=='primary' else 9) or pc+imm!=target: raise RuntimeError('compressed branch source/immediate differs')
+                    taken=a==0 if h=='c_beqz' else a!=0;outcomes.setdefault(h,[]).append(taken)
+                else:
+                    taken=True
+                    if h=='c_j' and (pc+imm!=target or a!=aa) or h!='c_j' and (d['rs1']!=10 or a!=target+1 or a&~1!=target): raise RuntimeError('compressed jump target/low-bit clearing differs')
+                wanted[4]=0x54414B45 if taken else 0x46414C4C
+                if h=='c_jalr':wanted[3]=pc+2
+                if len(by_pc.get(target,[]))!=int(taken) or len(by_pc.get(syms['fall_'+name],[]))!=int(not taken) or site['taken']!=taken: raise RuntimeError('compressed actual taken/untaken path differs')
+            else:
+                cause=3 if h=='c_ebreak' else 2;tval=pc if cause==3 else 0
+                if (a,b)!=(aa,bb) or site['cause']!=cause or fault_index>=len(traps) or traps[fault_index]!=('H0 S0:N0:C0:T0',f'{cause:x}',f'{tval:x}'): raise RuntimeError('compressed actual fault/input differs')
+                fault_values=struct.unpack_from('<4Q',memory,syms['record_'+name]-start+104)
+                if fault_values[:3]!=(cause,pc,tval) or fault_values[3]>>11&3!=3: raise RuntimeError('compressed cause/PC/tval/MPP snapshot differs')
+                for csr,value,offset in zip(captures,fault_values,(104,112,120,128)):
+                    e=captures[csr][fault_index];index=by_pc[e['pc']][fault_index][0]
+                    if e['word']>>20!={'mcause':0x342,'mepc':0x341,'mtval':0x343,'mstatus':0x300}[csr] or e['regs'].get('x5=')!=value or events[index+1]['memory']!=[(64,syms['record_'+name]+offset,'=',value)]: raise RuntimeError('compressed actual fault CSR read/store differs')
+                if row['fault']!={'mcause':cause,'mepc':hex(pc),'mtval':hex(tval),'mstatus':hex(fault_values[3])}: raise RuntimeError('normalized compressed fault differs')
+                fault_index+=1
+            if op['memory']!=mem or {k:v for k,v in op['regs'].items() if k.endswith('=')}!=({f'x{rd}=':wanted[regnames.index(f'x{rd}')]} if rd is not None else {}): raise RuntimeError('compressed operation register/MEM effects differ')
+            index=by_pc[pc][0][0];next_pc=events[index+1]['pc'];join=syms['join_'+name]
+            if next_pc!=(syms['trap_handler'] if kind=='fault' else syms['target_'+name] if taken else pc+2) or kind!='branch' and join!=pc+2: raise RuntimeError('compressed actual next PC/two-byte resumption differs')
+            if event('join_'+name)['word']!=0x00000B17 or event('join_'+name)['regs'].get('x22=')!=join: raise RuntimeError('compressed joined-PC capture differs')
+            offset=syms['record_'+name]-start
+            if pre[offset:offset+192]!=bytes([0xA5])*192: raise RuntimeError('compressed record sentinel differs')
+            for j,(phase,suffix,reg,value) in enumerate((p,s,r,v) for p,vs in [('before',values),('after',wanted)] for s,r,v in zip(('a','b','sp','ra','path'),regnames,vs)):
+                e=event(phase+'_'+suffix+'_'+name)
+                if e['regs'].get(reg+':')!=value or e['memory']!=[(64,start+offset+8*j,'=',value)] or int(row['registers_'+phase][reg],16)!=value: raise RuntimeError('compressed actual register/snapshot/reference differs')
+            for suffix,phase,off,value,rs2 in [('pc','after',80,join,22),('zero','before',88,0,0),('zero','after',96,0,0)]:
+                e=event(phase+'_'+suffix+'_'+name)
+                if e['word']&127!=0x23 or e['word']>>20&31!=rs2 or e['memory']!=[(64,start+offset+off,'=',value)]: raise RuntimeError('compressed PC/x0 encoded snapshot differs')
+            if any(row[k]!=site[k] for k in ('name','handler','pc','word','bytes_memory_order')) or row['hart']!=op['hart'] or (int(row['next_pc'],16),int(row['joined_pc'],16))!=(next_pc,join) or (row['x0_before'],row['x0_after'])!=(0,0) or row['actual_taken']!=taken: raise RuntimeError('compressed normalized identity/state differs')
+            if row['memory_events']!=[dict(width=w,address=hex(ad),access=access,value=hex(v)) for w,ad,access,v in mem]: raise RuntimeError('compressed normalized MEM events differ')
+            struct.pack_into('<13Q',expected,offset,*values,*wanted,join,0,0)
+            if fault_values:struct.pack_into('<4Q',expected,offset+104,*fault_values)
+            if bytes.fromhex(row['output_memory_bytes'])!=memory[offset:offset+192]: raise RuntimeError('compressed normalized output bytes differ')
+        if fault_index!=3 or len(traps)!=3 or any(len(es)!=3 for es in captures.values()) or any(sorted(outcomes.get(h,[]))!=[False,True] for h in ('c_beqz','c_bnez')): raise RuntimeError('compressed fault/predicate coverage incomplete')
+        if (directory/'operations.bin').read_bytes()!=b''.join(assembled) or (directory/'op.bin').read_bytes()!=assembled[0]: raise RuntimeError('compressed operation extraction differs')
+        struct.pack_into('<Q',expected,syms['trap_count']-start,3);struct.pack_into('<I',expected,syms['completion']-start,0x4B4F5445)
+        if memory!=expected or (directory/'expected.bin').read_bytes()!=expected or not event('park')['decoded'].startswith('wfi'): raise RuntimeError('compressed whole guards/completion differ')
+        runs.append(dict(run=run_name,validated_sites=36,handler_count=34,architectural_fault_count=3,**{'pass':True},sha256={n:hashlib.sha256((directory/n).read_bytes()).hexdigest() for n in required}))
+    paths=('processor.cpp','insns/c_arith.cpp','insns/c_branch.cpp','insns/c_loadstore.cpp','insns/system.cpp','insn.h','insn_util.h','mmu.cpp')
+    report=dict(scope='33 compressed handlers plus c.ebreak; actual 16-bit fields, registers/memory/control paths and architectural traps',et_platform_commit=commit,
+        verified_handlers=sorted(selected) if not missing else [],verified_architectural_fault_handlers=['c_ebreak','c_illegal','c_reserved'] if not missing else [],verified_runs=runs,runs_missing_evidence=missing,
+        limitations=['selected operands/offsets, both zero-branch paths and shifts 63/1; exhaustive compressed hints/reserved encodings and misalignment/protection cases not claimed',
+                     'compressed FP opcode slots select c_reserved in this pinned implementation; no double-precision execution claimed',
+                     'c.ebreak uses the ordinary reset debug configuration; DCSR is debug-only and was not read from M mode'],
+        source_sha256={'sw-sysemu/'+p:hashlib.sha256((source_root/'sw-sysemu'/p).read_bytes()).hexdigest() for p in paths})
+    (ROOT/'out/isa/compressed-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report,missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict, compressed: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -1619,6 +1831,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
     integer_normal = set(integer['verified_handlers'])
     memory_normal = set(memory['verified_handlers'])
     branch_normal = set(branches['verified_handlers'])
+    compressed_normal = set(compressed['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
@@ -1628,6 +1841,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                   'scalar integer execution audit' if row['mnemonic'] in integer_normal else \
                   'ordinary scalar memory execution audit' if name in memory_normal else \
                   'ordinary branch/jump execution audit' if name in branch_normal else \
+                  'compressed execution/architectural fault audit' if name in compressed_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
@@ -1642,6 +1856,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         verified_scalar_integer_handler_count=len(integer_normal),
         verified_base_memory_handler_count=len(memory_normal),
         verified_branch_handler_count=len(branch_normal),
+        verified_compressed_handler_count=len(compressed_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
@@ -1727,7 +1942,8 @@ def main() -> int:
     integer_report, missing_integer = scalar_integer_evidence(source_root, commit)
     memory_report, missing_memory = base_memory_evidence(source_root, commit)
     branch_report, missing_branches = branch_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report)
+    compressed_report, missing_compressed = compressed_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report, compressed_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1745,6 +1961,7 @@ def main() -> int:
     print(f"scalar integer: {len(integer_report['verified_handlers'])}/43 handlers with actual encoding/register/memory evidence; {ROOT / 'out/isa/scalar-integer-inventory.json'}")
     print(f"ordinary scalar memory: {len(memory_report['verified_handlers'])}/14 handlers with actual width/address/register/memory evidence; {ROOT / 'out/isa/base-memory-inventory.json'}")
     print(f"ordinary branch/jump: {len(branch_report['verified_handlers'])}/8 handlers with actual next-PC/link/alias/memory evidence; {ROOT / 'out/isa/branch-inventory.json'}")
+    print(f"compressed plus c.ebreak: {len(compressed_report['verified_handlers'])}/34 handlers with actual 16-bit/register/memory/path/fault evidence; {ROOT / 'out/isa/compressed-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -1767,6 +1984,8 @@ def main() -> int:
         raise RuntimeError("incomplete ordinary scalar memory execution/register evidence; inspect the separate memory inventory")
     if "--require-complete" in sys.argv and missing_branches:
         raise RuntimeError("incomplete ordinary branch/jump execution evidence; inspect the separate branch inventory")
+    if "--require-complete" in sys.argv and missing_compressed:
+        raise RuntimeError("incomplete compressed execution/fault evidence; inspect the separate compressed inventory")
     return 0
 
 

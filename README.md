@@ -33,6 +33,7 @@ python3 examples/scalar_fp.py
 python3 examples/scalar_integer.py
 python3 examples/base_memory.py
 python3 examples/branches.py
+python3 examples/compressed.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -71,6 +72,8 @@ It runs both ordinary scalar-memory cases covering 14 load/store/fence handlers,
 signed address offsets, integer extension/truncation, and all eight FP lanes.
 It runs both 16-site branch/jump cases: all eight handlers, both conditional
 outcomes, forward/backward targets, link writes, x0 discard and a `jalr` alias.
+It runs both 36-site compressed cases: all 33 compressed handlers plus
+`c.ebreak`, including arithmetic, memory, control flow and expected faults.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -135,20 +138,23 @@ Both ordinary scalar-memory cases must also supply all 14 handlers with actual
 access-width/address/value, register, control-state, and complete guard evidence.
 Both branch/jump cases must supply all eight handlers, both conditional paths,
 real next PCs, jump link and alias behavior, and complete guarded memory.
+Both compressed cases must supply all 34 selected handlers, two-byte encodings,
+actual register/MEM effects, both zero-branch outcomes and all three expected faults.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
 43 scalar-integer handlers, 14 ordinary scalar-memory handlers, eight
-branch/jump handlers, and **47 handlers without dedicated per-operation audit coverage**.
-Those 47 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other 45 include ordinary base instructions, architectural trap handlers,
-and reserved/illegal compressed handlers. These are handler counts, not a count
+branch/jump handlers, 33 compressed handlers plus `c.ebreak`, and
+**13 handlers without dedicated per-operation audit coverage**.
+Those 13 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other 11 are ordinary system and CSR handlers. These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
 The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
 The scalar-integer audit is `out/isa/scalar-integer-inventory.json`.
 The ordinary scalar-memory audit is `out/isa/base-memory-inventory.json`.
 The branch/jump audit is `out/isa/branch-inventory.json`.
+The compressed audit is `out/isa/compressed-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -511,6 +517,58 @@ register writes, recomputes predicates, and checks every load/snapshot store,
 next PC, path marker and full guarded dump. Timeout, watchdog expiry, unexpected
 traps, missing completion and changed guards fail. Full immediate ranges,
 misaligned/faulting targets, and privilege transitions are separate coverage.
+
+### Compressed instructions
+
+`compressed.py` covers all 33 active handlers from
+[`c_arith.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/c_arith.cpp),
+[`c_loadstore.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/c_loadstore.cpp),
+and [`c_branch.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/c_branch.cpp),
+plus `c.ebreak` from `system.cpp`. Each deterministic case has 36 sites:
+18 arithmetic handlers, eight memory handlers, seven branch/jump sites for
+five handlers, and three expected architectural fault handlers.
+
+Every selected instruction occupies two bytes. The fetch implementation
+zero-extends those bytes into the trace's 32-bit printed word; links and
+ordinary fallthrough advance PC by two. Startup, snapshots, routing and trap
+code explicitly use uncompressed instructions. The disassembly command uses
+`-z` to retain the illegal all-zero instruction; its initially omitted listing
+and failed host check are preserved in
+`out/isa/attempts/compressed-zero-disassembly/`. That attempt stopped before SysEmu.
+
+Arithmetic checks signed six-bit immediates, negative/positive `c.lui`, word
+sign extension, bit operations and shifts 63 versus 1. SP is explicitly
+initialized from the ELF's allocated stack for arithmetic; `c.addi16sp` changes
+it by -256/+128 and `c.addi4spn` adds +256/+128 into x10. Memory cases use
+guarded 128-byte targets, offsets 32/64, integer load sign extension and store
+truncation. Stack-relative cases derive SP from the target's actual symbol;
+each site resets it before use and the final code restores the allocated stack.
+
+Both `c.beqz` and `c.bnez` take both paths. Primary targets are forward and the
+second case uses backward targets. `c.j`/`c.jr` discard the link; `c.jalr` writes
+x1=PC+2. Register-target jumps receive odd addresses and clear bit 0. Raw next
+PCs, path markers, joined-PC `auipc` captures and actual x0 stores prove these
+effects. Two source trace labels need field-based identification: `c.bnez`
+prints `c.bneqz`, and the 32-bit `c.sw` store prints `c.sd`.
+
+Raw words `0x0000` and `0x8000` select `c_illegal` and `c_reserved` respectively;
+both raise cause 2 with mtval=0. `c.ebreak` (`0x9002`) raises cause 3 with
+mtval equal to its operation PC. All preserve the tested general registers.
+The M-mode trap handler snapshots cause/PC/tval/mstatus and resumes at PC+2.
+The pinned ordinary reset debug configuration selects breakpoint traps;
+DCSR is debug-only and is not read from M mode. Compressed FP opcode slots
+select `c_reserved` in this implementation; this suite makes no double-precision claim.
+
+Each guarded 192-byte record contains x10/x11/SP/x1/path before/after, the
+joined PC, x0 stores, and fault CSR snapshots where applicable. Whole monitor
+equality checks all targets, inputs, guards, fault count and completion. The
+independent parser repeats instruction-field, actual operand/write, reference,
+MEM width/address/value, branch/link and trap checks. Its initial decoder
+mistakenly treated register fields as an immediate; that failed audit is
+preserved in `out/isa/attempts/compressed-register-immediate/` and the corrected
+audit passed against the unchanged real execution evidence. Exhaustive hints,
+reserved encodings, immediate ranges and memory-protection faults remain
+outside these selected cases. The usual cycle watchdog and host timeout apply.
 
 ### Packed memory and atomics
 
@@ -1110,7 +1168,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
-Together with scalar integer, ordinary scalar memory and branches, the current default driver has 48 device runs
+Together with scalar integer, ordinary scalar memory, branches and compressed instructions, the current default driver has 50 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
@@ -1173,9 +1231,16 @@ and the matching `.exit` file. The additional checkpoint audit passed across
 47 ELF evidence sets, one fresh patched run, 462 artifact/upstream hashes,
 and 22 Python syntax checks; its log and zero exit are
 `out/isa/branches-checkpoint-audit.log` and the matching `.exit` file.
-Current dedicated CPU coverage is 306/353 handlers, leaving 47. The current
-default driver requires 48 fresh device runs; that full fresh run remains
-outstanding. Saved-artifact mode does not claim those 48 newly run programs.
+That checkpoint had dedicated CPU coverage of 306/353 handlers, leaving 47,
+and a 48-run default driver whose full fresh run remained outstanding.
+Saved-artifact mode did not claim those 48 newly run programs. The reports
+and original comparison/patched evidence are preserved under
+`out/isa/checkpoints/before-compressed/` and
+`out/compare/checkpoints/branches-completed/`.
+Both real compressed cases and their independent audit passed. Their actual
+command `python3 examples/compressed.py`, observed results and zero exit are
+saved in `out/compressed-all-console.log` and its matching `.exit` file.
+The independent audit is `out/isa/compressed-inventory.log` with a zero `.exit` file.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1214,6 +1279,12 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/isa/branch-inventory.json`: all eight handlers, both conditional outcomes,
   forward/backward target evidence, odd-target clearing, source/destination alias,
   decoded instruction fields, and independently checked artifact/source hashes.
+- `out/compressed/`: both real 36-site programs, two-byte instruction encodings,
+  actual scalar/SP/link/path and x0 snapshots, next PCs, memory accesses, three
+  architectural fault snapshots, guarded dumps and reproducible command logs.
+- `out/isa/compressed-inventory.json`: all 34 selected handlers independently
+  decoded and checked against actual register/MEM/control/trap events, plus
+  complete guarded outputs and artifact/upstream source hashes.
 - `out/isa/branches-completion-audit.json`: comparison audit of 47 saved
   example executions plus one fresh patched run, 462 artifact/upstream hashes,
   24 repository source hashes, executable-section dumps, completion/guard
