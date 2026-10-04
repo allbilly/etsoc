@@ -975,13 +975,18 @@ a profile of its real trace prefix are preserved in
 `out/compare/attempts/peer-host-validation-timeout/`. The driver audits about
 180 MiB across four cases; its combined host limit is now 1200 seconds.
 Each simulator invocation retains its 90-second timeout and cycle watchdog.
-The retry is not yet a passing full-comparison checkpoint.
+The corrected retry exited zero after 40 actual device runs: 39 example ELFs
+and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
+`out/compare/message-port-privilege-all-ops.log` and the matching `.exit` file.
+The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser. The current
 `tools/compare.py` adds those two executions (42 device runs per complete run);
-that expanded driver has not yet completed a full comparison. The live 40-run
-driver was launched before this addition; its exact source is preserved under
-`out/compare/checkpoints/message-port-privilege-source/` at commit `2f71f6b`.
+that expanded driver has not yet completed a full comparison.
+The completed 40-run driver was launched before this addition; its exact source
+is preserved under `out/compare/checkpoints/message-port-privilege-source/`
+at commit `2f71f6b`. Its final inventory audit also checks the independently run
+scalar-FP artifacts, but its own driver did not rerun those two cases.
 The actual repository command `python3 examples/scalar_fp.py` and its exit zero
 are saved in `out/scalar-fp-all-console.log` and the matching `.exit` file.
 `out/isa/scalar-fp-inventory.log` records the independent audit; its `.exit`
@@ -1135,6 +1140,14 @@ Generated outputs are ignored by Git and remain in `out/`:
   T1 state beyond the tested FCC/FLB paths, simultaneous synchronization
   contention, wider message delivery and tensor command paths remain unverified;
   U-mode port access is covered by the new diagnostic.
+- `out/isa/message-port-privilege-completion-audit.json`: completed 40-run
+  comparison checkpoint, independently checked across all 39 example ELF
+  layouts, raw evidence hashes, both M/U permission cases, all four peer cases,
+  and the fresh preserved ADD-to-MUL patch execution. The U-mode programs have
+  both `.text` and `.text.user` executable sections; both byte dumps are checked.
+  `out/isa/message-port-privilege-checkpoint-audit.py` reproduces that artifact
+  audit. The 40-run driver source snapshot and later inventory source are
+  identified separately; scalar-FP execution has its own milestone evidence.
 
 The first failed prestart-dump attempt is preserved in
 `out/add/attempts/failed-prestart-dump/`; it exposed the hexadecimal radix of
