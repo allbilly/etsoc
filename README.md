@@ -1024,7 +1024,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 `out/compare/message-port-privilege-all-ops.log` and the matching `.exit` file.
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
-register/control/fault/memory evidence checked by a second parser. The current
+register/control/fault/memory evidence checked by a second parser.
 Together with scalar integer, the current default driver has 44 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
@@ -1040,6 +1040,18 @@ Both actual scalar-integer cases passed, with the repository command and exit
 status saved in `out/scalar-integer-all-console.log` and its `.exit` file.
 The independent audit is recorded in `out/isa/scalar-integer-inventory.log`
 and the matching `.exit` file; it checks both actual ELF/trace/memory sets.
+`python3 tools/compare.py --reuse` also exited zero. It independently audited
+43 existing example artifact sets and freshly executed the patched ELF once;
+it does not represent 44 newly run device programs. Its report records
+`example_execution_mode`, `example_artifact_count=43`, and
+`fresh_device_execution_count=1`. The console/exit files are
+`out/compare/scalar-integer-reuse-console.log` and its `.exit` file.
+The additional checkpoint audit passed: 43 saved ELF evidence audits plus
+one fresh patched run, 394 artifact/upstream hashes, and 20 Python syntax checks.
+Its log and exit zero are `out/isa/scalar-integer-checkpoint-audit.log` and the
+matching `.exit` file.
+The completed earlier 40-run comparison and patched evidence are preserved
+under `out/compare/checkpoints/message-port-privilege-completed/`.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1075,6 +1087,11 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/isa/full-cpu-source-inventory.json`: active CPU decoder selectors with
   dedicated audit coverage and explicit remaining handlers; broader coverage
   is incomplete even when the implemented-suite gate passes.
+- `out/isa/scalar-integer-completion-audit.json`: comparison audit of 43 saved
+  example ELF executions plus one fresh patched run, all raw artifact/upstream
+  hashes, both scalar-FP/integer cases, all executable section dumps, complete
+  guarded outputs, and the single changed ADD ELF byte. Its mode is recorded
+  explicitly; a fresh full 44-run default comparison remains unrun.
 - `out/packed-int/`: 30 vector operations and 11 mask-operation sites,
   per-PC instruction encodings, trace register writes, masks, counts, and
   output-memory evidence for both deterministic cases.
