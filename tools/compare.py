@@ -184,7 +184,7 @@ def main() -> int:
                    ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
                    ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py",
                    ROOT / "examples" / "scalar_fp.py", ROOT / "examples" / "scalar_integer.py",
-                   ROOT / "examples" / "base_memory.py"):
+                   ROOT / "examples" / "base_memory.py", ROOT / "examples" / "branches.py"):
         if reuse:
             continue
         # Four peer cases audit every event in roughly 180 MiB of raw traces.
@@ -281,7 +281,7 @@ def main() -> int:
     evidence_reports = [inventory, *[json.loads((ROOT / "out/isa" / filename).read_text()) for filename in
         ('cache-csr-inventory.json','synchronization-inventory.json','message-port-inventory.json',
          'synchronization-peer-inventory.json','message-port-privilege-inventory.json',
-         'scalar-fp-inventory.json','scalar-integer-inventory.json','base-memory-inventory.json')]]
+         'scalar-fp-inventory.json','scalar-integer-inventory.json','base-memory-inventory.json','branch-inventory.json')]]
     example_runs = {run['run'] for evidence in evidence_reports for run in evidence['verified_runs']}
     example_runs.update(run['run'] for rows in inventory['trap_evidence'].values() for run in rows)
     integer_results = [json.loads((ROOT / "out/scalar-integer" / suffix / "result.json").read_text())
@@ -294,6 +294,11 @@ def main() -> int:
     if any(not result['pass'] or (result['operation_count'],result['handler_count'],result['trap_count']) != (14,14,0)
            for result in base_memory_results):
         raise RuntimeError('ordinary scalar memory execution, register or guard checks failed')
+    branch_results = [json.loads((ROOT / "out/branches" / suffix / "result.json").read_text())
+                      for suffix in ("", "exact")]
+    if any(not result['pass'] or (result['operation_count'],result['handler_count'],result['trap_count']) != (16,8,0)
+           for result in branch_results):
+        raise RuntimeError('ordinary branch/jump execution, next-PC or guard checks failed')
 
     add_root, mul_root, sub_root = (ROOT / "out" / name for name in ("add", "mul", "sub"))
     add_layout = json.loads((add_root / "elf-layout.json").read_text())
@@ -510,6 +515,8 @@ def main() -> int:
                            "cases": {result['case']: result['pass'] for result in integer_results}},
         "base_memory": {"instruction_count": 14, "handler_count": 14,
                         "cases": {result['case']: result['pass'] for result in base_memory_results}},
+        "branches": {"instruction_count": 16, "handler_count": 8,
+                     "cases": {result['case']: result['pass'] for result in branch_results}},
         "cpu_handler_coverage": {key: cpu_inventory[key] for key in
             ('decoded_handler_count','verified_dedicated_handler_count','remaining_dedicated_handler_count',
              'remaining_other_handler_count','remaining_explicit_mcode_stub_count')},
@@ -571,6 +578,9 @@ def main() -> int:
     print(f"packed floating-point: {packed_fp['operation_count']} sites in primary/exact cases: PASS")
     print('scalar floating-point: 31 sites per case, 22 implemented handlers and 6 cause-30 stubs: PASS')
     print('scalar integer: 61 sites per case, 43 handlers with zero-divisor/overflow/overshift cases: PASS')
+    print('ordinary scalar memory: 14 handlers per case, signed offsets, actual access widths/addresses and complete FP lanes: PASS')
+    print('ordinary branch/jump: 16 sites per case, 8 handlers, both predicates, forward/backward targets and link/alias/x0 checks: PASS')
+    print(f"dedicated CPU handlers: {cpu_inventory['verified_dedicated_handler_count']}/{cpu_inventory['decoded_handler_count']}; remaining {cpu_inventory['remaining_dedicated_handler_count']}")
     print("packed memory: 33 sites in primary/exact cases: PASS")
     print("packed atomic: 22 sites in primary/exact/alias cases: PASS")
     print("scalar memory: 45 sites in primary/exact cases: PASS")

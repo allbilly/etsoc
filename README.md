@@ -32,6 +32,7 @@ python3 examples/packed_fp.py
 python3 examples/scalar_fp.py
 python3 examples/scalar_integer.py
 python3 examples/base_memory.py
+python3 examples/branches.py
 python3 examples/packed_memory.py
 python3 examples/packed_atomic.py
 python3 examples/scalar_memory.py
@@ -68,6 +69,8 @@ It runs both 61-site scalar-integer cases covering all 43 arithmetic handlers
 and selected zero-divisor, signed-overflow, and oversized-shift cases.
 It runs both ordinary scalar-memory cases covering 14 load/store/fence handlers,
 signed address offsets, integer extension/truncation, and all eight FP lanes.
+It runs both 16-site branch/jump cases: all eight handlers, both conditional
+outcomes, forward/backward targets, link writes, x0 discard and a `jalr` alias.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -130,19 +133,22 @@ their selected arithmetic edge cases. This flag checks the implemented suites; t
 inventory still has explicit gaps and is not a claim of complete base-ISA coverage.
 Both ordinary scalar-memory cases must also supply all 14 handlers with actual
 access-width/address/value, register, control-state, and complete guard evidence.
+Both branch/jump cases must supply all eight handlers, both conditional paths,
+real next PCs, jump link and alias behavior, and complete guarded memory.
 `out/isa/full-cpu-source-inventory.json` enumerates all active decoder functions,
 excludes literal `#if 0` branches, and ties selectors to the separate execution
 audits. It finds 353 handlers: 213 ET extensions, 28 scalar-FP handlers,
-43 scalar-integer handlers, 14 ordinary scalar-memory handlers, and
-**55 handlers without dedicated per-operation audit coverage**.
-Those 55 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
-The other 53 include ordinary base instructions, architectural trap handlers,
+43 scalar-integer handlers, 14 ordinary scalar-memory handlers, eight
+branch/jump handlers, and **47 handlers without dedicated per-operation audit coverage**.
+Those 47 include two explicit microcode stubs (`fence.i`, `sfence.vma`).
+The other 45 include ordinary base instructions, architectural trap handlers,
 and reserved/illegal compressed handlers. These are handler counts, not a count
 of distinct encodings or exhaustive test cases. Ordinary startup executes some
 base instructions; incidental execution does not establish dedicated coverage.
 The separate scalar-FP audit is `out/isa/scalar-fp-inventory.json`.
 The scalar-integer audit is `out/isa/scalar-integer-inventory.json`.
 The ordinary scalar-memory audit is `out/isa/base-memory-inventory.json`.
+The branch/jump audit is `out/isa/branch-inventory.json`.
 Dynamic CSR engine commands remain separate from these counts.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
@@ -471,6 +477,40 @@ the pinned simulator handler only logs and returns. This provides no concurrent
 memory-ordering or hardware-fence claim. Misalignment/page/protection faults
 and exhaustive aliases are not covered by these selected cases. Both the
 20,000-cycle watchdog and 90-second simulator timeout remain mandatory.
+
+### Ordinary branches and jumps
+
+`branches.py` executes all eight handlers from
+[`branch.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insns/branch.cpp):
+`beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu`, `jal`, and `jalr`.
+Each case has 16 sites: both taken/untaken outcomes for the six predicates,
+`jal` with a link register and x0 destination, and `jalr` with a separate link
+register and source/destination alias. Negative versus positive operands
+distinguish signed and unsigned comparisons. The primary case branches/jumps
+forward; the second branches/jumps backward. A routing jump skips the backward
+target block during setup, so each selected instruction executes exactly once.
+
+Actual next-instruction PCs establish each decision. Each path writes a distinct
+marker (`TAKE` or `FALL`), and an `auipc` at the join captures its actual PC.
+Guarded 128-byte records contain x10/x11/x20/x21 before/after, the joined PC,
+and actual x0 stores before/after. `jal` writes PC+4; the x0 variant discards
+that write. `jalr` receives an odd base-plus-offset target and clears bit 0.
+Its alias variant writes the link into x10 while jumping through the original
+x10 value. Primary and second `jalr` offsets are +24 and -24.
+
+SysEmu suppresses x0 register logging, so the zero-register evidence comes from
+encoded `sd x0` instructions, raw MEM64 writes, and actual dumped bytes.
+The first host-validation attempt incorrectly required an x0 read log, after
+the ELF had completed normally; that diagnostic is preserved under
+`out/isa/attempts/branches-x0-log/`. The corrected cases passed.
+
+The independent audit decodes B/J/I immediates using
+[`insn.h`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/insn.h)
+and the pinned decoder tables, reconstructs the actual operands from complete
+register writes, recomputes predicates, and checks every load/snapshot store,
+next PC, path marker and full guarded dump. Timeout, watchdog expiry, unexpected
+traps, missing completion and changed guards fail. Full immediate ranges,
+misaligned/faulting targets, and privilege transitions are separate coverage.
 
 ### Packed memory and atomics
 
@@ -1070,7 +1110,7 @@ and a fresh ADD-to-MUL patched ELF. Its console log and exit status are
 The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
-Together with scalar integer and ordinary scalar memory, the current default driver has 46 device runs
+Together with scalar integer, ordinary scalar memory and branches, the current default driver has 48 device runs
 per complete run. That expanded driver has not yet completed a fresh full
 comparison. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
@@ -1116,9 +1156,16 @@ and the matching `.exit` file. The additional checkpoint audit also passed:
 45 ELF evidence sets, one fresh patched run, 428 artifact/upstream hashes,
 and 21 Python syntax checks. Its log/exit files are
 `out/isa/base-memory-checkpoint-audit.log` and the matching `.exit` file.
-Current dedicated CPU coverage is 298/353 handlers, leaving 55. The current
-default driver requires 46 fresh device runs; that full fresh run remains
-outstanding. Saved-artifact mode does not claim those 46 newly run programs.
+That checkpoint had dedicated CPU coverage of 298/353 handlers, leaving 55,
+and a 46-run default driver whose full fresh run remained outstanding.
+Saved-artifact mode did not claim those 46 newly run programs. Its reports and
+comparison/patched evidence are preserved under
+`out/isa/checkpoints/before-branches/` and
+`out/compare/checkpoints/base-memory-completed/`.
+Both actual branch/jump cases and their independent audit passed.
+`python3 examples/branches.py` and its exit zero are recorded in
+`out/branches-all-console.log` and its matching `.exit` file. The independent
+audit is `out/isa/branch-inventory.log` with a zero `.exit` file.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1151,6 +1198,12 @@ Generated outputs are ignored by Git and remain in `out/`:
   targets, ELF-derived inputs, and command logs.
 - `out/isa/base-memory-inventory.json`: all 14 handler identities, independent
   decoder-field and raw state/memory checks, both cases, and artifact/source hashes.
+- `out/branches/`: both actual 16-site branch/jump programs, B/J/I encodings,
+  real next-PC sequences, source/link/path register snapshots, x0 device stores,
+  joined-PC capture, guarded monitor dumps, and reproducible command logs.
+- `out/isa/branch-inventory.json`: all eight handlers, both conditional outcomes,
+  forward/backward target evidence, odd-target clearing, source/destination alias,
+  decoded instruction fields, and independently checked artifact/source hashes.
 - `out/isa/base-memory-completion-audit.json`: comparison audit of 45 saved
   example ELF executions and one fresh patched run, 428 artifact/upstream
   hashes, 23 repository source hashes, executable-section dumps, whole guarded

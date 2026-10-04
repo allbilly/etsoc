@@ -1456,7 +1456,143 @@ def base_memory_evidence(source_root: Path, commit: str) -> tuple[dict[str, obje
     return report,missing
 
 
-def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict) -> dict:
+def branch_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Decode B/J/I fields and independently prove actual branch/jump paths."""
+    selected={name for name,row in definitions(source_root/'sw-sysemu/insns').items() if row['source']=='insns/branch.cpp'}
+    if selected!={'beq','bne','blt','bge','bltu','bgeu','jal','jalr'}: raise RuntimeError('pinned branch handler inventory changed')
+    def sign(value,width): return value-(1<<width) if value>>(width-1) else value
+    def decode(word):
+        # processor.cpp dec_branch/dec_jal/dec_jalr and insn.h immediate fields.
+        opcode=word&127
+        if opcode==0x63:
+            name={0:'beq',1:'bne',4:'blt',5:'bge',6:'bltu',7:'bgeu'}.get(word>>12&7)
+            if name is None or word>>15&31!=10 or word>>20&31!=11: raise RuntimeError('branch selector/source fields differ')
+            immediate=((word>>31)<<12)|((word>>7&1)<<11)|((word>>25&63)<<5)|((word>>8&15)<<1)
+            return name,sign(immediate,13),0
+        if opcode==0x6F:
+            immediate=((word>>31)<<20)|((word>>12&255)<<12)|((word>>20&1)<<11)|((word>>21&1023)<<1)
+            return 'jal',sign(immediate,21),word>>7&31
+        if opcode==0x67 and word>>12&7==0 and word>>15&31==10:
+            return 'jalr',sign(word>>20,12),word>>7&31
+        raise RuntimeError('unexpected branch/jump opcode or source field')
+    runs,missing=[],[]
+    for case in ('primary','exact'):
+        directory=ROOT/'out/branches'/('' if case=='primary' else case)
+        required=('result.json','registers.json','operations.json','elf-layout.json','kernel.S','link.ld',
+                  'kernel.elf','kernel.asm','text.bin','operations.bin','op.bin','elf-inspection.txt',
+                  'symbols.txt','commands.log','prestart.bin','output.bin','expected.bin')
+        run_name=str(directory.relative_to(ROOT))
+        if any(not (directory/name).is_file() for name in required): missing.append(run_name); continue
+        result,registers,sites,layout=(json.loads((directory/name).read_text()) for name in ('result.json','registers.json','operations.json','elf-layout.json'))
+        if not result.get('pass') or not result.get('whole_monitor_matches') or result['case']!=case or (result['operation_count'],result['handler_count'],result['trap_count'])!=(16,8,0): raise RuntimeError('branch result/count/completion failure')
+        if len(sites)!=16 or len(registers['operations'])!=16 or result['operations']!=registers['operations'] or {s['mnemonic'] for s in sites}!=selected: raise RuntimeError('branch site coverage or normalized rows differ')
+        elf,pre,memory=((directory/name).read_bytes() for name in ('kernel.elf','prestart.bin','output.bin'))
+        if elf[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',elf,18)[0]!=243: raise RuntimeError('branch ELF architecture differs')
+        entry,phoff,shoff=struct.unpack_from('<3Q',elf,24)
+        phsize,phcount,shsize,shcount,strings=struct.unpack_from('<5H',elf,54)
+        segments=[struct.unpack_from('<II6Q',elf,phoff+i*phsize) for i in range(phcount)]
+        sections=[struct.unpack_from('<II4QII2Q',elf,shoff+i*shsize) for i in range(shcount)]
+        names=elf[sections[strings][4]:sections[strings][4]+sections[strings][5]]
+        sections={names[s[0]:].split(b'\0',1)[0].decode():s for s in sections}
+        if [name for name,s in sections.items() if s[2]&4 and s[5]]!=['.text'] or entry!=int(layout['entry'],16): raise RuntimeError('branch executable section/entry mismatch')
+        text=sections['.text']
+        if (directory/'text.bin').read_bytes()!=elf[text[4]:text[4]+text[5]]: raise RuntimeError('branch text extraction differs')
+        start,size=int(layout['monitor_address'],16),layout['monitor_size']
+        maps=[p[2]+start-p[3] for p in segments if p[0]==1 and p[3]<=start and start+size<=p[3]+p[5]]
+        if len(maps)!=1 or len(pre)!=size or len(memory)!=size or pre!=elf[maps[0]:maps[0]+size]: raise RuntimeError('branch initial memory differs from ELF data')
+        syms={s[2]:int(s[0],16) for line in (directory/'symbols.txt').read_text().splitlines() if len(s:=line.split())==3}
+        trace=(directory/'trace.log').read_text()
+        if 'Finishing emulation' not in trace or 'Error, max cycles reached' in trace or re.search(r'\b(?:trap|exception)\b',trace,re.I): raise RuntimeError('branch incomplete/faulting execution')
+        events,current=[],None
+        for line in trace.splitlines():
+            match=re.match(r'^\d+: DEBUG EMU: \[(H\d+ S\d+:N\d+:C\d+:T\d+)\] I\(M\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\) (.*)$',line)
+            if match:
+                current=dict(hart=match[1],pc=int(match[2],16),word=int(match[3],16),decoded=match[4],regs={},memory=[]); events.append(current)
+            elif current is not None:
+                match=re.search(r'\b(x\d+) ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['regs'][match[1]+match[2]]=int(match[3],16)
+                match=re.search(r'MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)',line)
+                if match: current['memory'].append((int(match[1]),int(match[2],16),match[3],int(match[4],16)))
+        if any(e['hart']!='H0 S0:N0:C0:T0' for e in events): raise RuntimeError('branch unexpected executing hart')
+        by_pc={}
+        for index,e in enumerate(events): by_pc.setdefault(e['pc'],[]).append((index,e))
+        def event(name):
+            found=by_pc.get(syms[name],[])
+            if len(found)!=1: raise RuntimeError('branch missing/repeated actual site '+name)
+            return found[0][1]
+        state,before={},{}
+        pcs={int(s['pc'],16) for s in sites}
+        for e in events:
+            if e['pc'] in pcs: before[e['pc']]=dict(state)
+            for key,value in e['regs'].items():
+                if key.endswith('='): state[key[:-1]]=value
+        expected,assembled,conditional_outcomes=bytearray(pre),[],{}
+        for site,row in zip(sites,registers['operations']):
+            name,pc=site['name'],int(site['pc'],16); op=event('op_'+name)
+            offsets=[p[2]+pc-p[3] for p in segments if p[0]==1 and p[1]&1 and p[3]<=pc and pc+4<=p[3]+p[5]]
+            raw=bytes.fromhex(site['bytes_memory_order']); word=int.from_bytes(raw,'little'); assembled.append(raw)
+            if len(raw)!=4 or len(offsets)!=1 or elf[offsets[0]:offsets[0]+4]!=raw or offsets[0]!=int(site['file_offset'],16) or word!=int(site['word'],16) or word!=op['word']: raise RuntimeError('branch actual ELF bytes/offset/trace mismatch')
+            mnemonic,immediate,rd=decode(word)
+            if mnemonic!=site['mnemonic'] or op['decoded'].split()[0]!=mnemonic or rd!=site['rd']: raise RuntimeError('branch decoder identity/register fields differ')
+            a,b=struct.unpack_from('<2Q',pre,syms['input_'+name]-start)
+            for j,reg in enumerate(('x10','x11')):
+                load=event(('load_a_' if j==0 else 'load_b_')+name); value=(a,b)[j]
+                if load['regs'].get(reg+'=')!=value or load['memory']!=[(64,syms['input_'+name]+8*j,':',value)]: raise RuntimeError('branch operands lack actual register/MEM load evidence')
+            source=before[pc]
+            if tuple(source.get(r) for r in ('x10','x11','x20','x21'))!=(a,b,0x5AA55AA55AA55AA5,0xCAFE): raise RuntimeError('branch operands/seeds lack complete actual write reconstruction')
+            target=syms['target_'+name]
+            negative,positive=(-3,5) if case=='primary' else (-17,9)
+            if mnemonic=='jalr':
+                if immediate!=(24 if case=='primary' else -24) or a!=target-immediate+1 or (a+immediate)&1!=1 or rd not in (10,20): raise RuntimeError('jalr signed offset/odd target/alias case differs')
+                taken=True; next_pc=(a+immediate)&~1
+            elif mnemonic=='jal':
+                if a!=negative&((1<<64)-1) or rd not in (0,20): raise RuntimeError('jal source/link variants differ')
+                taken=True; next_pc=pc+immediate
+            else:
+                if word>>15&31!=10 or word>>20&31!=11 or op['regs'].get('x10:')!=a or op['regs'].get('x11:')!=b: raise RuntimeError('conditional branch operand fields/reads differ')
+                aa,bb=sign(a,64),sign(b,64)
+                taken={'beq':a==b,'bne':a!=b,'blt':aa<bb,'bge':aa>=bb,'bltu':a<b,'bgeu':a>=b}[mnemonic]
+                conditional_outcomes.setdefault(mnemonic,[]).append(taken)
+                if pc+immediate!=target or {a,b}-{negative&((1<<64)-1),positive}: raise RuntimeError('branch immediate/selected signed inputs differ')
+                next_pc=target if taken else pc+4
+            if b!=positive and not (mnemonic in ('beq','bne','blt','bge','bltu','bgeu') and b==negative&((1<<64)-1)): raise RuntimeError('branch input case B differs')
+            direction='forward' if case=='primary' else 'backward'
+            if site['direction']!=direction or (target>pc)!=(direction=='forward') or next_pc!=(target if taken else pc+4): raise RuntimeError('branch target direction/decoded next PC differs')
+            index=by_pc[pc][0][0]
+            if events[index+1]['pc']!=next_pc or len(by_pc.get(target,[]))!=int(taken) or len(by_pc.get(syms['fall_'+name],[]))!=int(not taken): raise RuntimeError('actual next instruction/selected path differs')
+            if mnemonic=='jalr' and op['regs'].get('x10:')!=a: raise RuntimeError('jalr original source read differs')
+            wanted_write={f'x{rd}=':pc+4} if rd else {}
+            if {k:v for k,v in op['regs'].items() if k.endswith('=')}!=wanted_write or op['memory']: raise RuntimeError('jump link writes/branch side effects differ')
+            join=syms['join_'+name]; joined=event('join_'+name)
+            if joined['word']!=0x00000B17 or joined['regs'].get('x22=')!=join: raise RuntimeError('joined PC lacks actual AUIPC evidence')
+            offset=syms['record_'+name]-start
+            if pre[offset:offset+128]!=bytes([0xA5])*128: raise RuntimeError('branch record sentinel differs')
+            wanted=(a,b,0x5AA55AA55AA55AA5,0xCAFE,pc+4 if rd==10 else a,b,pc+4 if rd==20 else 0x5AA55AA55AA55AA5,0x54414B45 if taken else 0x46414C4C)
+            for j,(phase,suffix,reg) in enumerate((p,s,r) for p in ('before','after') for s,r in [('a','x10'),('b','x11'),('link','x20'),('path','x21')]):
+                snapshot=event(phase+'_'+suffix+'_'+name)
+                if snapshot['regs'].get(reg+':')!=wanted[j] or snapshot['memory']!=[(64,start+offset+8*j,'=',wanted[j])] or int(row[reg+'_'+phase],16)!=wanted[j]: raise RuntimeError('branch actual register/snapshot/reference differs')
+            for suffix,phase,off,value,rs2 in [('pc','after',64,join,22),('zero','before',72,0,0),('zero','after',80,0,0)]:
+                snapshot=event(phase+'_'+suffix+'_'+name)
+                if snapshot['word']&127!=0x23 or snapshot['word']>>12&7!=3 or snapshot['word']>>20&31!=rs2 or snapshot['memory']!=[(64,start+offset+off,'=',value)]: raise RuntimeError('branch PC/x0 device snapshot differs')
+            if any(row[k]!=site[k] for k in ('name','mnemonic','pc','word','bytes_memory_order')) or row['hart']!=op['hart'] or row['actual_taken']!=taken or site['taken']!=taken or (int(row['target_pc'],16),int(row['next_pc'],16),int(row['joined_pc'],16))!=(target,next_pc,join) or (row['x0_before'],row['x0_after'])!=(0,0): raise RuntimeError('branch normalized state/path identity differs')
+            struct.pack_into('<11Q',expected,offset,*wanted,join,0,0)
+            if bytes.fromhex(row['output_memory_bytes'])!=memory[offset:offset+128]: raise RuntimeError('branch normalized output bytes differ')
+        if any(sorted(conditional_outcomes.get(name,[]))!=[False,True] for name in selected-{'jal','jalr'}): raise RuntimeError('both conditional outcomes not proven')
+        if {s['rd'] for s in sites if s['mnemonic']=='jal'}!={0,20} or {s['rd'] for s in sites if s['mnemonic']=='jalr'}!={10,20}: raise RuntimeError('jump link/discard/alias coverage missing')
+        if (directory/'operations.bin').read_bytes()!=b''.join(assembled) or (directory/'op.bin').read_bytes()!=assembled[0]: raise RuntimeError('branch operation extraction differs')
+        struct.pack_into('<I',expected,syms['completion']-start,0x4B4F5445)
+        if memory!=expected or (directory/'expected.bin').read_bytes()!=expected or not event('park')['decoded'].startswith('wfi'): raise RuntimeError('branch whole guarded memory/completion mismatch')
+        runs.append(dict(run=run_name,validated_sites=16,handler_count=8,target_direction=direction,both_conditional_outcomes=True,**{'pass':True},sha256={name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in required}))
+    paths=('processor.cpp','insns/branch.cpp','insn_util.h','insn.h')
+    report=dict(scope='ordinary branch/jump decoder fields, actual next-PC paths, link/alias/x0 snapshots and whole guarded memory',
+        et_platform_commit=commit,verified_handlers=sorted(selected) if not missing else [],verified_runs=runs,runs_missing_evidence=missing,
+        limitations=['selected forward/backward offsets and signed operands only; full immediate ranges, misaligned/faulting targets and privilege transitions are separate'],
+        source_sha256={'sw-sysemu/'+name:hashlib.sha256((source_root/'sw-sysemu'/name).read_bytes()).hexdigest() for name in paths})
+    (ROOT/'out/isa/branch-inventory.json').write_text(json.dumps(report,indent=2)+'\n')
+    return report,missing
+
+
+def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, scalar: dict, integer: dict, memory: dict, branches: dict) -> dict:
     """Enumerate active CPU decoder selectors; record dedicated audited coverage."""
     path = source_root / 'sw-sysemu/processor.cpp'
     source = path.read_text()
@@ -1482,6 +1618,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
     scalar_faults = set(scalar['verified_fault_stubs'])
     integer_normal = set(integer['verified_handlers'])
     memory_normal = set(memory['verified_handlers'])
+    branch_normal = set(branches['verified_handlers'])
     rows = []
     for name in sorted(decoded_by):
         row = handlers[name]
@@ -1490,6 +1627,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
                   'scalar FP fault audit' if row['mnemonic'] in scalar_faults else \
                   'scalar integer execution audit' if row['mnemonic'] in integer_normal else \
                   'ordinary scalar memory execution audit' if name in memory_normal else \
+                  'ordinary branch/jump execution audit' if name in branch_normal else \
                   'not independently audited by a dedicated operation suite'
         rows.append(dict(handler='insn_'+name,**row,decoder_functions=decoded_by[name],dedicated_coverage=covered))
     remaining = [row for row in rows if row['dedicated_coverage'].startswith('not independently')]
@@ -1503,6 +1641,7 @@ def full_cpu_source_inventory(source_root: Path, commit: str, extension: dict, s
         verified_scalar_fp_handler_count=len(scalar_normal),verified_scalar_fp_fault_count=len(scalar_faults),
         verified_scalar_integer_handler_count=len(integer_normal),
         verified_base_memory_handler_count=len(memory_normal),
+        verified_branch_handler_count=len(branch_normal),
         decoder_handlers=selectors,operations=rows,disabled_source_handler_mentions=sorted(all_selectors-set(decoded_by)-{'reserved','illegal','exec_funct_t'}),
         source_sha256={'sw-sysemu/processor.cpp':hashlib.sha256(path.read_bytes()).hexdigest()},
         limits=['Counts are handler selectors, not distinct instruction encodings or exhaustive test cases.',
@@ -1587,7 +1726,8 @@ def main() -> int:
     scalar_fp_report, missing_scalar_fp = scalar_fp_evidence(source_root, commit)
     integer_report, missing_integer = scalar_integer_evidence(source_root, commit)
     memory_report, missing_memory = base_memory_evidence(source_root, commit)
-    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report)
+    branch_report, missing_branches = branch_evidence(source_root, commit)
+    cpu_report = full_cpu_source_inventory(source_root, commit, document, scalar_fp_report, integer_report, memory_report, branch_report)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
     print(f"handlers that explicitly trap: {document['trap_stub_mnemonics']}")
@@ -1604,6 +1744,7 @@ def main() -> int:
     print(f"scalar FP: {len(scalar_fp_report['verified_normal_handlers'])}/22 implemented handlers and {len(scalar_fp_report['verified_fault_stubs'])}/6 fault stubs; {ROOT / 'out/isa/scalar-fp-inventory.json'}")
     print(f"scalar integer: {len(integer_report['verified_handlers'])}/43 handlers with actual encoding/register/memory evidence; {ROOT / 'out/isa/scalar-integer-inventory.json'}")
     print(f"ordinary scalar memory: {len(memory_report['verified_handlers'])}/14 handlers with actual width/address/register/memory evidence; {ROOT / 'out/isa/base-memory-inventory.json'}")
+    print(f"ordinary branch/jump: {len(branch_report['verified_handlers'])}/8 handlers with actual next-PC/link/alias/memory evidence; {ROOT / 'out/isa/branch-inventory.json'}")
     print(f"all active CPU selectors with dedicated audits: {cpu_report['verified_dedicated_handler_count']}/{cpu_report['decoded_handler_count']}; remaining {cpu_report['remaining_dedicated_handler_count']} (including {cpu_report['remaining_explicit_mcode_stub_count']} microcode stubs)")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -1624,6 +1765,8 @@ def main() -> int:
         raise RuntimeError("incomplete scalar integer execution/register evidence; inspect the separate integer inventory")
     if "--require-complete" in sys.argv and missing_memory:
         raise RuntimeError("incomplete ordinary scalar memory execution/register evidence; inspect the separate memory inventory")
+    if "--require-complete" in sys.argv and missing_branches:
+        raise RuntimeError("incomplete ordinary branch/jump execution evidence; inspect the separate branch inventory")
     return 0
 
 
