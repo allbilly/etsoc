@@ -1052,6 +1052,13 @@ Its log and exit zero are `out/isa/scalar-integer-checkpoint-audit.log` and the
 matching `.exit` file.
 The completed earlier 40-run comparison and patched evidence are preserved
 under `out/compare/checkpoints/message-port-privilege-completed/`.
+An audit-script filename mismatch briefly wrote the new summary to the earlier
+checkpoint's JSON path. Diagnostics are preserved in
+`out/isa/attempts/scalar-integer-audit-path/`. Both corrected audits passed:
+the earlier 40-run summary was restored from the unchanged example artifacts,
+archived original comparison/patched evidence, and the immutable `693fc4b`
+source tree. The new summary has its own `scalar-integer-completion-audit.json`
+path. No raw execution artifacts were changed by that correction.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
