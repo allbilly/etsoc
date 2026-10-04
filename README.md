@@ -1109,6 +1109,16 @@ The command `python3 examples/base_memory.py`, observed results, and exit zero
 are saved in `out/base-memory-all-console.log` and its matching `.exit` file.
 `out/isa/base-memory-inventory.log` and its zero `.exit` file record the
 independent 14-handler audit of both actual ELF/trace/memory sets.
+The expanded `python3 tools/compare.py --reuse` passed, independently auditing
+45 saved example executions and freshly running the copied ADD-to-MUL ELF.
+Its log and zero exit status are `out/compare/base-memory-reuse-console.log`
+and the matching `.exit` file. The additional checkpoint audit also passed:
+45 ELF evidence sets, one fresh patched run, 428 artifact/upstream hashes,
+and 21 Python syntax checks. Its log/exit files are
+`out/isa/base-memory-checkpoint-audit.log` and the matching `.exit` file.
+Current dedicated CPU coverage is 298/353 handlers, leaving 55. The current
+default driver requires 46 fresh device runs; that full fresh run remains
+outstanding. Saved-artifact mode does not claim those 46 newly run programs.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1141,6 +1151,11 @@ Generated outputs are ignored by Git and remain in `out/`:
   targets, ELF-derived inputs, and command logs.
 - `out/isa/base-memory-inventory.json`: all 14 handler identities, independent
   decoder-field and raw state/memory checks, both cases, and artifact/source hashes.
+- `out/isa/base-memory-completion-audit.json`: comparison audit of 45 saved
+  example ELF executions and one fresh patched run, 428 artifact/upstream
+  hashes, 23 repository source hashes, executable-section dumps, whole guarded
+  output checks, and the independently verified single-byte ELF change.
+  `out/isa/base-memory-checkpoint-audit.py` reproduces this artifact audit.
 - `out/isa/scalar-integer-inventory.json`: all 43 handlers matched against the
   pinned definitions, independently decoded operation fields and arithmetic
   references, zero/overflow/overshift evidence, and artifact/source hashes.
