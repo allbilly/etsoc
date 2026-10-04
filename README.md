@@ -15,6 +15,25 @@ lanes are produced by ET instructions in SysEmu. These are standalone minion
 ISA experiments: they do not execute a tensor-engine kernel, exercise the
 PCIe driver or firmware path, or measure hardware performance.
 
+## Verified checkpoint
+
+The full fresh `python3 tools/compare.py` passed: 23 example drivers executed
+53 bare-metal ELF cases, then a copied ADD ELF patched to MUL ran once more.
+All **353 active CPU instruction handlers** have dedicated execution or
+expected-fault audits. Sixteen pinned handlers are unimplemented microcode
+stubs: their verified result is cause 30, rather than an arithmetic or fence result.
+ADD, MUL and the 8x8x8 packed-FP GEMM pass both deterministic input cases.
+
+The independent checkpoint audit verifies 567 artifact/upstream source hashes,
+all executable sections, register/memory evidence and the single-byte ELF patch.
+It also checks all 23 actual driver exits, all 53 fresh SysEmu command blocks,
+and the source snapshot used to launch the run. Logs and machine-readable
+evidence are `out/compare/fresh54-console.log`, its zero `.exit` file, and
+`out/isa/fresh54-completion-audit.json`. The setup and full-platform integration
+check were verified earlier; current installed tool digests were checked again.
+The tested scope is the original standalone minion ISA scope. Tensor/matrix-engine
+commands and hardware performance remain separate and unverified.
+
 ## Run
 
 The tested setup already had a working ET Platform installation in a running
@@ -1308,8 +1327,9 @@ The previously failed host-timeout attempt is retained separately.
 Both scalar-FP cases have passed independently, with all 31 sites and complete
 register/control/fault/memory evidence checked by a second parser.
 Together with scalar integer, ordinary scalar memory, branches, compressed, CSR and system instructions, the current default driver has 54 device runs
-per complete run. That expanded driver has not yet completed a fresh full
-comparison. The saved-artifact audit mode labels its separate evidence explicitly.
+per complete run. At the earlier checkpoints below, the expanded driver's fresh
+full comparison was still outstanding. The final fresh 54-run comparison now
+passes. The saved-artifact audit mode labels its separate evidence explicitly.
 The completed 40-run driver was launched before this addition; its exact source
 is preserved under `out/compare/checkpoints/message-port-privilege-source/`
 at commit `2f71f6b`. Its final inventory audit also checks the independently run
@@ -1395,7 +1415,7 @@ Both CSR instruction cases and their independent audit have now passed: all
 26 sites per case, six handlers and six expected read-only faults per case.
 The real command `python3 examples/csr.py` and zero exit are preserved in
 `out/csr-all-console.log` and its matching `.exit` file. The independent audit
-is `out/isa/csr-instruction-inventory.log` with a zero `.exit` file. Dedicated
+is `out/isa/csr-instruction-inventory.log` with a zero `.exit` file.
 That checkpoint had CPU coverage of 346/353 handlers, leaving seven. Its default
 comparison required 52 fresh device runs; that full fresh comparison was
 outstanding. Previous reports and comparison evidence are archived under
@@ -1415,9 +1435,9 @@ lower-mode helper exits, actual M/S/U return state and terminal WFI waiting.
 The real command `python3 examples/system.py` and zero exit are in
 `out/system-all-console.log` and the matching `.exit` file. The independent
 audit is `out/isa/system-instruction-inventory.log` with a zero `.exit` file.
-All 353 selected CPU handlers now have dedicated execution/fault evidence;
-the default comparison requires 54 fresh device runs, and a fresh complete
-run of that expanded driver remains outstanding. Previous reports and
+All 353 selected CPU handlers had dedicated execution/fault evidence at that
+checkpoint; its default comparison required 54 fresh device runs, and the fresh
+complete run was still outstanding then. Previous reports and
 comparison evidence are archived in `out/isa/checkpoints/before-system/`
 and `out/compare/checkpoints/csr-completed/`.
 The expanded `python3 tools/compare.py --reuse` passed: 53 saved example
@@ -1429,6 +1449,27 @@ one fresh patched run, 567 artifact/upstream hashes and 25 Python syntax
 checks. Its log and zero exit are `out/isa/system-instruction-checkpoint-audit.log`
 and the matching `.exit` file. Saved-artifact mode does not claim 54 newly
 executed programs.
+The complete default command `python3 tools/compare.py` has now passed after
+54 fresh device executions: 53 example ELF cases across all 23 drivers and
+one newly executed ADD-to-MUL patched ELF. The actual zero exit, complete
+console and launch/finish metadata are `out/compare/fresh54-console.exit`,
+`out/compare/fresh54-console.log` and `out/compare/fresh54-job.json`. Its
+combined host duration was 1016.49 seconds; that is verification wall time,
+not a device performance measurement. The run used repository commit
+`42c5c8f981a8abd4778287877b6b767dfe93ba74`.
+The independent fresh checkpoint audit passed across all 53 newly executed
+ELF cases, the new patched run, 567 artifact/upstream hashes, 25 Python syntax
+checks and 27 repository source hashes. It verifies every actual driver exit
+and per-case SysEmu command/trace block, as well as fresh output timestamps
+and the committed launch source snapshot. Its command is
+`python3 out/isa/fresh54-checkpoint-audit.py`; log and zero exit are
+`out/isa/fresh54-checkpoint-audit.log` and the matching `.exit` file.
+The prior completed evidence was copied with Btrfs reflinks before regeneration
+to `out/checkpoints/before-fresh54/`; all 567 copied artifact/upstream hashes
+and 27 source hashes were checked. The current installed simulator, assembler,
+objdump and GCC hashes match the recorded installation; that read-only check
+is `out/setup/fresh54-tool-digests.log` with a zero `.exit` file. Setup and
+`it_test_code_loading` were not rerun as part of the 54-run comparison.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1519,8 +1560,16 @@ Generated outputs are ignored by Git and remain in `out/`:
   register events, references, six cause-30 faults, full memory, pinned source
   hashes, and both sets of artifact hashes.
 - `out/isa/full-cpu-source-inventory.json`: active CPU decoder selectors with
-  dedicated audit coverage and explicit remaining handlers; broader coverage
-  is incomplete even when the implemented-suite gate passes.
+  dedicated audit coverage of all 353 handlers and zero remaining selectors.
+  Exhaustive operands/privileges and dynamic CSR engine commands remain separate.
+- `out/isa/fresh54-completion-audit.json`: final fresh comparison evidence,
+  all 353 selected CPU handlers, 53 newly executed example ELF cases plus one
+  newly executed patched ELF, 567 artifact/upstream hashes, 27 current and
+  committed-launch source hashes, and actual driver/per-case command exits.
+  `out/isa/fresh54-checkpoint-audit.py` reproduces the independent artifact audit.
+- `out/checkpoints/before-fresh54/`: preserved prior verified execution,
+  source and comparison artifacts, including the copied ADD-to-MUL patch,
+  copy commands/exits and the independently verified snapshot manifest.
 - `out/isa/scalar-integer-completion-audit.json`: comparison audit of 43 saved
   example ELF executions plus one fresh patched run, all raw artifact/upstream
   hashes, both scalar-FP/integer cases, all executable section dumps, complete
