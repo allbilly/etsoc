@@ -1166,6 +1166,16 @@ Both actual branch/jump cases and their independent audit passed.
 `python3 examples/branches.py` and its exit zero are recorded in
 `out/branches-all-console.log` and its matching `.exit` file. The independent
 audit is `out/isa/branch-inventory.log` with a zero `.exit` file.
+The expanded `python3 tools/compare.py --reuse` passed, auditing 47 saved
+example executions and freshly running the patched ADD-to-MUL ELF once.
+Its console and zero exit status are `out/compare/branches-reuse-console.log`
+and the matching `.exit` file. The additional checkpoint audit passed across
+47 ELF evidence sets, one fresh patched run, 462 artifact/upstream hashes,
+and 22 Python syntax checks; its log and zero exit are
+`out/isa/branches-checkpoint-audit.log` and the matching `.exit` file.
+Current dedicated CPU coverage is 306/353 handlers, leaving 47. The current
+default driver requires 48 fresh device runs; that full fresh run remains
+outstanding. Saved-artifact mode does not claim those 48 newly run programs.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1204,6 +1214,11 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/isa/branch-inventory.json`: all eight handlers, both conditional outcomes,
   forward/backward target evidence, odd-target clearing, source/destination alias,
   decoded instruction fields, and independently checked artifact/source hashes.
+- `out/isa/branches-completion-audit.json`: comparison audit of 47 saved
+  example executions plus one fresh patched run, 462 artifact/upstream hashes,
+  24 repository source hashes, executable-section dumps, completion/guard
+  checks and the independently verified single-byte ELF patch.
+  `out/isa/branches-checkpoint-audit.py` reproduces this artifact audit.
 - `out/isa/base-memory-completion-audit.json`: comparison audit of 45 saved
   example ELF executions and one fresh patched run, 428 artifact/upstream
   hashes, 23 repository source hashes, executable-section dumps, whole guarded
