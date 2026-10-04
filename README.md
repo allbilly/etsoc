@@ -38,6 +38,7 @@ python3 examples/cache_control.py
 python3 examples/synchronization.py
 python3 examples/synchronization_peers.py
 python3 examples/message_ports.py
+python3 examples/message_port_privilege.py
 python3 tools/compare.py
 python3 tools/inventory.py --require-complete
 ```
@@ -56,6 +57,8 @@ cases, including two real cross-minion blocking/wake cases and two cases that
 overfill the configured ring and wrap the emulator's 8-bit message count.
 It reruns four peer-synchronization cases for T0/T1 FCC routing, block/wake,
 wrong-thread isolation, credit overflow and ordered FLB arrivals.
+It also runs two message-port permission diagnostics that enter real U mode
+and check access, fault state and unchanged destinations on all four ports.
 A successful run reports
 `PASS` and exits zero. Host Python and the standard library are the only
 Python dependencies.
@@ -105,6 +108,20 @@ cache CSRs, plus both synchronization cases and their five selected CSRs.
 It also requires all six message-port cases and all 12 port CSRs.
 All four peer-synchronization cases must supply real FCC restart, wrong-counter
 or wrong-thread isolation, overflow and ordered FLB evidence.
+Both M/U message-port permission cases must supply successful U reads,
+expected privilege/disabled-port faults and retained-message evidence.
+Source inspection also finds base RISC-V handlers outside the ET extension
+inventory. The current source-only report in
+`out/isa/full-cpu-source-inventory.json` excludes literal `#if 0` blocks and
+identifies 353 active decoder-selected handlers: the 213 ET extension handlers
+above and 140 base-instruction handlers without dedicated audit coverage.
+Those 140 comprise 132 nontrapping handlers and eight explicit microcode stubs.
+Ordinary startup executes some base instructions; this count requires
+dedicated per-operation evidence. Scalar FP contributes 22 nontrapping
+handlers and six fault stubs to that remainder. Its source-only review is in
+`out/isa/scalar-fp-source-review.json`; a dedicated scalar-FP experiment has
+not been implemented or executed yet. Dynamic CSR command identities remain
+separate from this instruction count.
 Without that flag, the inventory
 can also be used before running examples to inspect the outstanding gaps.
 
@@ -121,6 +138,11 @@ ET_CONTAINER=my-et-container ET_CONTAINER_PREFIX=/opt/et ./setup.sh
 the same environment overrides. Ordinary example runs do not need `sudo`.
 The Podman route is verified here. The host-prefix route remains untested;
 its assembler-probe file-name error was corrected during review.
+If the recorded container stopped after a host reboot, restart the same
+installation with `podman start et-platform-rebuild` before running examples.
+The recovered container's platform revision and simulator SHA-256 were checked
+against the setup record, and its ET assembler/disassembler probe passed again.
+Recovery commands and results are saved in `out/setup/container-recovery-*`.
 On macOS, use a Linux VM or Linux container environment for the tools; this
 repo does not attempt a native macOS simulator/toolchain port.
 
@@ -280,7 +302,8 @@ and GNU objdump decode bytes `5b 06 b5 60` (word `0x60b5065b`) as
 The linker places `.text` at `0x8000001000`, `.data` at `0x8000100000`, and a
 16 KiB `NOBITS` stack at `0x8000200000`. Because the trap handler is page
 aligned, `.text` includes an alignment gap and the handler; `.text` is the
-only executable section in these ELFs. In ADD/MUL/SUB, C begins at
+only executable section in these arithmetic ELFs. The M/U message-port
+diagnostic uses two executable sections, described below. In ADD/MUL/SUB, C begins at
 `0x8000100060` and the 160-byte monitored range also contains completion/trap
 words and three register snapshots. GEMM has a larger monitor region sized
 from its linked matrix output and snapshots. The scripts derive addresses
@@ -673,7 +696,54 @@ The direct ESR path rejects message widths greater than 8; 16/32-byte
 delivery requires another upstream engine path and remains unverified. OOB
 enable is tested with zero OOB: the pinned direct and delayed delivery paths
 both supply zero, and the inspected source has no nonzero minion producer.
-Nonzero OOB and U-mode access have no execution proof. No simulator patch is required.
+Nonzero OOB has no execution proof. U-mode access is exercised by the separate
+permission diagnostic below. No simulator patch is required.
+
+### Message-port permissions in real U mode
+
+`message_port_privilege.py` runs primary/exact cases with four-/eight-byte
+messages. Each case executes 92 selected CSR, send and ECALL sites across all
+four ports. It records 32 expected illegal-instruction faults, 12 U ECALL
+phase exits and 20 successful head reads, including four empty nonblocking
+reads. These fault counts describe this diagnostic; ordinary FIFO examples
+still reject all traps.
+
+For each port, the program configures and sends two messages in M mode with
+the U-enable bit clear. It enters U through `mret` with `mstatus.MPP=U` and
+interrupts disabled. Both head reads fault with `mcause=2`, linked `mepc` and
+the actual instruction word in `mtval`. Their seeded x20 destinations remain
+unchanged. After an explicit U ECALL exit, M reads return offsets 0 and the
+message width with the original two payloads, proving denied reads did not
+consume them. A second phase enables U access and verifies both successful
+U heads and an empty nonblocking return of `-1`. Reading `portctrl` from U
+still faults because its CSR address encodes a higher minimum privilege.
+A third phase disables the port: both M and U heads fault without waiting,
+even with its U-enable bit set.
+
+The ELF has `.text` at `0x8000001000` for M code and `.text.user` at
+`0x8004001000` for U code. Shared data starts at `0x8004100000`, in the
+OS-box region that permits these accesses. The initial attempt used the
+arithmetic link layout and took an instruction-access fault on the first U
+fetch because that address lies in the protected machine box. The corrected
+layout follows the pinned [`memmap.h`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/memmap.h)
+and [`pma_et.cpp`](https://github.com/aifoundry-org/et-platform/blob/836a4ab600e93c3059bb58c898edbc37744cd8d0/sw-sysemu/pma_et.cpp)
+without disabling protection. Every operation PC is translated through its
+executable `PT_LOAD`; `text.bin` and `text-user.bin` preserve both sections.
+The OS-box layout requires OS-box access to be enabled in the existing
+machine protection configuration; actual fetches and memory accesses verify
+this in the tested setup.
+
+The trap handler captures `mcause`, `mepc`, `mtval` and `mstatus` before returning
+from each expected fault. Illegal reads resume in their original mode; U ECALL
+returns to an explicitly linked M continuation. Other fault causes record an
+unexpected-trap diagnostic and park without setting completion. The host checks
+actual `I(M)`/`I(U)` groups, `mret` privilege transitions, trap MPP bits,
+destination writes/snapshots, sender and receiver memory accesses, payload
+loads and every monitored byte/guard. An independent inventory audit repeats
+those checks against ELF inputs and raw logs.
+
+Run `python3 examples/message_port_privilege.py` for both cases. S-mode,
+U-mode blocking/wake and read-only CSR write side effects remain unverified.
 
 ### Graphics extensions
 
@@ -832,6 +902,7 @@ EXPECTED TRAPS: 8 arithmetic stubs raise cause 30; disabled graphics raises caus
 CACHE CONTROL: 37/37 sites across 13 CSRs pass in both primary and exact cases
 SYNCHRONIZATION: 23/24 sites across 5 CSRs pass; real STALL wait/wake observed
 MESSAGE PORTS: 80/80 sites across 12 CSRs in both FIFO cases; both blocking cases and both 60-site overcapacity/count-wrap cases pass
+MESSAGE-PORT PRIVILEGE: both 92-site M/U cases pass; 32 illegal faults and 12 U ECALL exits per case
 PEER SYNCHRONIZATION: all four T0/T1 FCC routes, block/restart, wrong-thread/wrong-counter isolation, real 16-bit overflow and ordered FLB pass
 ```
 
@@ -841,7 +912,7 @@ measured elementwise words, ADD-to-MUL XOR/bit position,
 source/disassembly/register diffs, the GEMM run summary, and patched-ELF
 execution result plus packed-suite summaries.
 The scalar-memory summary is recorded in the same comparison report.
-The latest full `python3 tools/compare.py` run exited zero after 38 actual
+The completed checkpoint before the M/U permission extension exited zero after 38 actual
 device runs, including both cache/synchronization cases, all six message-port
 cases, all four peer-synchronization cases and the patched ELF.
 Its console log and exit status are saved as
@@ -850,6 +921,17 @@ Its console log and exit status are saved as
 port run is saved in `out/message-ports-overflow-all-console.log` with exit
 status zero in the matching `.exit` file. The independent port audit
 is saved in `out/isa/message-port-overflow-inventory.log` and its `.exit` file.
+Both standalone M/U permission cases and their independent trace audit passed;
+their logs are `out/message-port-privilege-primary-console.log`,
+`out/message-port-privilege-exact-console.log` and
+`out/isa/message-port-privilege-inventory.log`, each with a zero `.exit` file.
+The first expanded full comparison expired its combined 600-second peer-driver
+host limit after SysEmu had completed the T1 ELF normally. That failed run and
+a profile of its real trace prefix are preserved in
+`out/compare/attempts/peer-host-validation-timeout/`. The driver audits about
+180 MiB across four cases; its combined host limit is now 1200 seconds.
+Each simulator invocation retains its 90-second timeout and cycle watchdog.
+The retry is not yet a passing full-comparison checkpoint.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -903,10 +985,13 @@ Generated outputs are ignored by Git and remain in `out/`:
   complete 255-send loops, count-wrap readbacks, seeded snapshots, guarded
   memory and expected-byte files. `checkpoints/before-overflow/` preserves
   the earlier four-case programs and audit record.
+- `out/message-port-privilege/`: both 92-site M/U kernels, separate M and U
+  executable-section dumps, real instruction-mode and trap-state records,
+  sender/receiver/payload events, guarded memory and actual register snapshots.
 - `out/compare/`: ADD/MUL/SUB source/disassembly/register diffs, decoder excerpt,
   whole-ELF and patch diffs, patched ELF, patched execution evidence, and the
   verified GEMM, packed-suite, scalar-memory, graphics, expected-trap, cache,
-  synchronization, peer-synchronization, message-port, and extension-coverage
+  synchronization, peer-synchronization, message-port, permission and extension-coverage
   summaries in `comparison.json`.
 - `out/isa/instruction-inventory.json`: revision-checked decoded ET handler
   names, implementation source files, feature gates, explicit trap stubs,
@@ -931,8 +1016,13 @@ Generated outputs are ignored by Git and remain in `out/`:
   register records, guarded memory, H2 device sends and H0 wait/wake/retry.
   Every repeated send is checked against source registers, ELF input bytes,
   actual ESR and receiver memory writes. Overcapacity overwrite and count
-  wrap are checked on all four ports. Wider delivery engines, nonzero OOB and
-  U-mode access remain unverified.
+  wrap are checked on all four ports. Wider delivery engines and nonzero OOB
+  remain unverified; the U-mode proof is recorded separately below.
+- `out/isa/message-port-privilege-inventory.json`: independent audit of both
+  real M/U cases, all 92 selected sites, explicit U entry and M exit,
+  44 actual traps per case, preserved destinations, denied-read queue
+  preservation, allowed U payload reads, complete guarded monitor bytes and
+  source/artifact hashes. It extends the separate FIFO inventory above.
 - `out/isa/completion-audit.json`: artifact audit of 23 example runs and the
   patched ELF, including ELF entry points, executable sections, instruction
   bytes, completion/trap memory, strict JSON, and independent `PT_LOAD`
@@ -970,17 +1060,17 @@ Generated outputs are ignored by Git and remain in `out/`:
   wrong-thread/wrong-counter isolation, overflow, ordered FLB snapshots and
   the preserved ADD-to-MUL patch proof. Its source hashes describe that earlier
   checkpoint, before the message-port overflow cases.
-- `out/isa/message-port-overflow-completion-audit.json`: current 38-run
+- `out/isa/message-port-overflow-completion-audit.json`: earlier 38-run
   checkpoint, all 37 example ELFs' executable sections and `.text` bytes,
   matching artifact/upstream source hashes, all six message-port cases,
   complete 255-send trace sequences, overcapacity slot overwrite, count-wrap
-  head results, all four peer cases and the ADD-to-MUL patch proof. Run
-  `python3 out/isa/message-port-overflow-checkpoint-audit.py` to repeat this
-  additional artifact audit. Internal queue counts are inferred from complete
+  head results, all four peer cases and the ADD-to-MUL patch proof. Its source
+  hashes and U-mode limitation describe that earlier checkpoint. Internal
+  queue counts are inferred from complete
   device events and the pinned source type; they are not debugger reads.
   T1 state beyond the tested FCC/FLB paths, simultaneous synchronization
-  contention, U-mode access, wider message delivery and tensor command paths
-  remain unverified.
+  contention, wider message delivery and tensor command paths remain unverified;
+  U-mode port access is covered by the new diagnostic.
 
 The first failed prestart-dump attempt is preserved in
 `out/add/attempts/failed-prestart-dump/`; it exposed the hexadecimal radix of
@@ -1002,3 +1092,9 @@ The first message-port validation attempt is preserved in
 the correct payload, but the host initially required the literal `lwu` trace
 name. The pinned scalar implementation prints `lw` for `lwu`; the checker now
 verifies the actual unsigned-load encoding and zero-extended register result.
+The first U-mode attempt is preserved in
+`out/message-port-privilege/attempts/user-code-in-mbox/`: it hit an actual
+instruction-access fault and failed the cycle watchdog. The corrected program
+uses separate permitted M/U sections and fails on unexpected fault causes.
+`attempts/stopped-container/` preserves the earlier host-side availability
+failure after a reboot, before any new ELF executed.

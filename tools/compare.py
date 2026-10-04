@@ -177,9 +177,14 @@ def main() -> int:
                    ROOT / "examples" / "scalar_memory.py", ROOT / "examples" / "graphics.py",
                    ROOT / "examples" / "trap_stubs.py", ROOT / "examples" / "cache_control.py",
                    ROOT / "examples" / "synchronization.py", ROOT / "examples" / "message_ports.py",
-                   ROOT / "examples" / "synchronization_peers.py"):
-        result = add_example.run_logged(commands, [sys.executable, str(script)], 600)
-        add_example.require(result, f"run {script.name}")
+                   ROOT / "examples" / "synchronization_peers.py", ROOT / "examples" / "message_port_privilege.py"):
+        # Four peer cases audit every event in roughly 180 MiB of raw traces.
+        # Allow their host validation to finish; each SysEmu invocation retains
+        # its own 90-second timeout and cycle watchdog.
+        driver_timeout = 1200 if script.name == "synchronization_peers.py" else 600
+        result = add_example.run_logged(commands, [sys.executable, str(script)], driver_timeout)
+        if result.returncode:
+            raise RuntimeError(f"run {script.name} failed with exit status {result.returncode}; inspect {commands}")
     gemm_result = json.loads((ROOT / "out" / "gemm" / "result.json").read_text())
     gemm_exact = json.loads((ROOT / "out" / "gemm" / "exact" / "result.json").read_text())
     if any(not result["pass"] or result["fma_count"] != 64 or result["broadcast_count"] != 64
@@ -213,6 +218,13 @@ def main() -> int:
                     for subdir in ("", "exact", "blocking-primary", "blocking-exact", "overflow-primary", "overflow-exact")]
     peer_results = [json.loads((ROOT / "out" / "synchronization-peers" / subdir / "result.json").read_text())
                     for subdir in ("", "exact", "threads-primary", "threads-exact")]
+    privilege_results = [json.loads((ROOT / "out/message-port-privilege" / subdir / "result.json").read_text())
+                         for subdir in ("", "exact")]
+    for result in privilege_results:
+        if (not result["pass"] or not result["whole_monitor_matches"] or result["operation_count"] != 92 or
+                result["csr_count"] != 12 or result["illegal_trap_count"] != 32 or result["user_ecall_count"] != 12 or
+                result["successful_head_count"] != 20):
+            raise RuntimeError("message-port real M/U permission checks failed")
     for result in peer_results:
         proof = result["proof"]
         thread_case = result["case"].startswith("threads")
@@ -482,6 +494,11 @@ def main() -> int:
             "pass": result["pass"], "instruction_count": result["operation_count"], "proof": result["proof"]} for result in peer_results},
             "credit_esr_routes": sorted({result["proof"]["credit_esr"] for result in peer_results}),
             "scope": "T0/T1 FCC0/FCC1 routing, zero-credit wait/restart, wrong-thread/wrong-counter isolation, real overflow and ordered FLB"},
+        "message_port_privilege": {"csr_count": 12, "cases": {result["case"]: {
+            "pass": result["pass"], "instruction_count": result["operation_count"], "message_width": result["message_width"],
+            "illegal_trap_count": result["illegal_trap_count"], "user_ecall_count": result["user_ecall_count"],
+            "successful_head_count": result["successful_head_count"]} for result in privilege_results},
+            "scope": "real M/U execution; denied reads retain messages, enabled U reads, disabled-port and U control faults"},
         "extension_coverage": {"handler_count": inventory["unique_handler_count"],
                                "verified_nontrapping_handlers": inventory["verified_execution_handler_count"],
                                "unimplemented_trap_stubs": inventory["trap_stub_mnemonics"],
@@ -511,6 +528,7 @@ def main() -> int:
     print("cache control: 37 sites across 13 CSRs in primary/exact cases: PASS")
     print("synchronization: 23/24 sites across 5 CSRs and actual timed STALL wait/wake: PASS")
     print("message ports: 80 sites across 12 CSRs per FIFO case; both blocking cases and both 60-site overcapacity/count-wrap cases: PASS")
+    print("message-port privilege: both 92-site real M/U cases, 32 illegal faults and 12 U ECALL exits per case: PASS")
     print("peer synchronization: all four T0/T1 FCC routes, block/restart, wrong-thread/wrong-counter isolation, real 16-bit overflow and ordered FLB: PASS")
     print("graphics: 30 sites in primary/exact cases: PASS")
     print("expected traps: 8 cause-30 arithmetic stubs and disabled-graphics cause-2 fault: PASS")

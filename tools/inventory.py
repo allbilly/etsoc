@@ -528,6 +528,217 @@ def message_port_evidence(source_root: Path, commit: str) -> tuple[dict[str, obj
     return report, missing
 
 
+def message_port_privilege_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
+    """Independently audit real U-mode port reads, faults and retained messages."""
+    declarations = {name: int(number, 16) for number, name in re.findall(
+        r"CSRDEF\((0x[0-9a-f]+),\s*(\w+),", (source_root / "sw-sysemu/csrs.h").read_text()) if name.startswith("port")}
+    if len(declarations) != 12:
+        raise RuntimeError("message-port privilege CSR declarations changed")
+    runs, missing = [], []
+    for case in ("primary", "exact"):
+        directory = ROOT / "out/message-port-privilege" / ("" if case == "primary" else case)
+        required = ("result.json", "elf-layout.json", "kernel.elf", "kernel.S", "trace.log", "output.bin",
+                    "prestart.bin", "expected.bin", "registers.json", "operations.json", "text.bin", "text-user.bin")
+        run_name = str(directory.relative_to(ROOT))
+        if any(not (directory / name).is_file() for name in required):
+            missing.append(run_name)
+            continue
+        result, layout, sites, registers = (json.loads((directory / name).read_text()) for name in
+                                           ("result.json", "elf-layout.json", "operations.json", "registers.json"))
+        if (not result.get("pass") or not result.get("whole_monitor_matches") or result.get("operation_count") != 92 or
+                result.get("illegal_trap_count") != 32 or result.get("user_ecall_count") != 12 or
+                result.get("successful_head_count") != 20 or len(sites) != 92 or len(registers["operations"]) != 64):
+            raise RuntimeError("incomplete message-port privilege result/site records")
+        if result.get("csr_count") != 12 or result.get("message_width") != (4 if case == "primary" else 8):
+            raise RuntimeError("privilege normalized CSR/width counts disagree with the audited cases")
+        elf, pre, memory = ((directory / name).read_bytes() for name in ("kernel.elf", "prestart.bin", "output.bin"))
+        if elf[:6] != b"\x7fELF\x02\x01" or struct.unpack_from("<H", elf, 18)[0] != 243:
+            raise RuntimeError("privilege ELF is not little-endian RISC-V ELF64")
+        phoff, phsize, phcount = struct.unpack_from("<Q", elf, 32)[0], *struct.unpack_from("<HH", elf, 54)
+        segments = [struct.unpack_from("<II6Q", elf, phoff + i * phsize) for i in range(phcount)]
+        def offset(address, size=4, executable=True):
+            matches = [p[2] + address - p[3] for p in segments if p[0] == 1 and (not executable or p[1] & 1)
+                       and p[3] <= address and address + size <= p[3] + p[5]]
+            if len(matches) != 1:
+                raise RuntimeError("privilege address lacks one PT_LOAD mapping")
+            return matches[0]
+        syms = {k: int(v, 16) for k, v in layout["symbols"].items()}
+        start, size = int(layout["monitor_address"], 16), layout["monitor_size"]
+        data_offset = offset(start, size, False)
+        if len(pre) != size or len(memory) != size or pre != elf[data_offset:data_offset + size] or \
+                memory != (directory / "expected.bin").read_bytes():
+            raise RuntimeError("privilege input/output/ELF memory mismatch")
+        trace = (directory / "trace.log").read_text()
+        if "Finishing emulation" not in trace or "Error, max cycles reached" in trace or "unlocked!" in trace or \
+                re.search(r"(?:Start|Stop) waiting for message", trace):
+            raise RuntimeError("privilege diagnostic stalled or did not complete")
+        observed, current = {}, None
+        for line in trace.splitlines():
+            match = re.match(r"^(\d+): DEBUG EMU: \[(H\d+) .*?\] I\(([MSU])\): 0x([0-9a-f]+) \(0x([0-9a-f]{8})\)", line)
+            if match:
+                cycle, hart, mode, pc, word = match.groups()
+                current = dict(cycle=int(cycle), hart=hart, mode=mode, pc=int(pc, 16), word=int(word, 16), registers={}, raw=[], accesses=[])
+                observed.setdefault(int(pc, 16), []).append(current)
+            if current is not None:
+                current["raw"].append(line)
+                reg = re.search(r"\bx(\d+) ([=:]) 0x([0-9a-f]+)", line)
+                if reg:
+                    current["registers"][(int(reg[1]), reg[2])] = int(reg[3], 16)
+                access = re.search(r"MEM(8|16|32|64)\[0x([0-9a-f]+)\] ([=:]) 0x([0-9a-f]+)", line)
+                if access:
+                    current["accesses"].append((int(access[1]), int(access[2], 16), access[3], int(access[4], 16)))
+        if {e["hart"] for events in observed.values() for e in events} != {"H0"}:
+            raise RuntimeError("unexpected hart in privilege trace")
+        def event(label, mode="M"):
+            events = observed.get(syms[label], [])
+            if len(events) != 1 or events[0]["mode"] != mode:
+                raise RuntimeError(f"missing actual {mode} instruction at {label}")
+            return events[0]
+        relative = lambda name: syms[name] - start
+        expected = bytearray(pre)
+        width, way, flags = (4, 1, 0) if case == "primary" else (8, 2, 2)
+        values = struct.unpack_from("<16Q", pre, relative("input_payloads"))
+        inputs = [(0xABCDEF0000000000 | (0x81234567 + p * 0x1010101 + i * 0x11111111)) if case == "primary" else
+                  (0xFEDCBA9876543210 ^ (p * 0x1111111111111111) ^ (i * 0x102030405060708)) for p in range(4) for i in range(4)]
+        if values != tuple(inputs):
+            raise RuntimeError("privilege deterministic ELF inputs differ")
+        feature = struct.unpack_from("<3Q", memory, relative("feature_state"))
+        if feature[1] != feature[0] & ~0x2E or feature[2] & 8:
+            raise RuntimeError("wrong actual privilege feature/interrupt setup")
+        for label, value in zip(("feature_before", "feature_after", "status_initial"), feature):
+            if event(label)["registers"][(5, "=")] != value:
+                raise RuntimeError("privilege setup snapshot differs from real read")
+        expected[relative("feature_state"):relative("feature_state") + 24] = struct.pack("<3Q", *feature)
+        names = set()
+        for p in range(4):
+            for phase in ("deny", "allow", "disabled"):
+                names.add(f"p{p}_{phase}_config")
+                names.add(f"p{p}_{phase}_exit")
+                names.update(f"p{p}_{phase}_u_{suffix}" for suffix in ("head", "headnb"))
+                if phase != "disabled":
+                    names.update(f"p{p}_{phase}_{suffix}" for suffix in ("send0", "send1", "u_control"))
+                if phase == "allow": names.add(f"p{p}_{phase}_u_empty")
+                else: names.update(f"p{p}_{phase}_m_{suffix}" for suffix in ("head", "headnb"))
+            lock = event(f"lock_{p}")
+            address, pos = syms[f"target_{p}"] + 64, relative(f"target_{p}") + 64
+            raw = "\n".join(lock["raw"])
+            if not re.search(rf"MEM512\[0x0*{address:x}\] = \{{(?:\s*\d+:0x00000000){{16}}\s*\}}", raw) or \
+                    pre[pos - 64:pos + 128] != bytes([0xA5]) * 192:
+                raise RuntimeError("privilege backing-memory lock/guards lack raw evidence")
+            expected[pos:pos + 64] = bytes(64)
+            for phase in ("deny", "allow", "disabled"):
+                entered = event(f"enter_p{p}_{phase}")
+                if entered["word"] != 0x30200073 or "prv = U" not in "\n".join(entered["raw"]) or \
+                        not 0x8004000000 <= syms[f"user_p{p}_{phase}"] < 0x8100000000:
+                    raise RuntimeError("actual mret/U-mode entry or permitted user address missing")
+        if {s["name"] for s in sites} != names:
+            raise RuntimeError("privilege selected sites do not cover all four port permission paths")
+        snapshots = {r["name"]: r for r in registers["operations"]}
+        captures = {k: observed.get(syms[f"capture_{k}"], []) for k in ("cause", "epc", "tval", "status")}
+        trap_logs = re.findall(r"\[H0 S0:N0:C0:T0\].*Trapping to M-mode with cause 0x([0-9a-f]+) and tval 0x([0-9a-f]+)", trace)
+        if len(trap_logs) != 44 or any(len(rows) != 44 or any(e["mode"] != "M" for e in rows) for rows in captures.values()):
+            raise RuntimeError("privilege fault count/handler modes disagree")
+        fault_index, verified = 0, []
+        for site in sites:
+            name = site["name"]
+            p, phase, suffix = re.fullmatch(r"p([0-3])_(deny|allow|disabled)_(.+)", name).groups()
+            p = int(p)
+            kind = "config" if suffix == "config" else "send" if suffix.startswith("send") else "ecall" if suffix == "exit" else "read"
+            mode = "U" if suffix == "exit" or suffix.startswith("u_") else "M"
+            cause = 8 if kind == "ecall" else 2 if kind == "read" and (phase == "disabled" or suffix.endswith("control") or mode == "U" and phase == "deny") else 0
+            actual = event(f"op_{name}", mode)
+            pc, word = actual["pc"], actual["word"]
+            filepos = offset(pc)
+            if word != int(site["word"], 16) or elf[filepos:filepos + 4] != bytes.fromhex(site["bytes_memory_order"]) or \
+                    filepos != int(site["file_offset"], 16) or int.from_bytes(elf[filepos:filepos + 4], "little") != word or \
+                    site["mode"] != mode or site["kind"] != kind or site.get("cause", 0) != cause:
+                raise RuntimeError("privilege ELF/instruction/permission metadata disagrees")
+            if kind in ("config", "read"):
+                family = "ctrl" if kind == "config" or suffix.endswith("control") else "head" if suffix.endswith("_head") else "headnb"
+                csr = declarations[f"port{family}{p}"]
+                if (word & 127, word >> 20, word >> 12 & 7, word >> 7 & 31, word >> 15 & 31) != \
+                        (0x73, csr, 1 if kind == "config" else 2, 0 if kind == "config" else 20, 6 if kind == "config" else 0):
+                    raise RuntimeError("privilege actual SYSTEM/CSR encoding differs")
+            elif kind == "ecall" and word != 0x73:
+                raise RuntimeError("wrong encoded U ECALL")
+            elif kind == "send" and (word & 127, word >> 12 & 7, word >> 15 & 31, word >> 20 & 31) != (0x23, 3, 7, 6):
+                raise RuntimeError("wrong encoded privilege device send")
+            if kind == "config":
+                address = syms[f"target_{p}"] + 64
+                control = (way << 24) | (((address >> 6) & 15) << 16) | 0x100 | ((width.bit_length() - 1) << 5) | flags | \
+                          (0x10 if phase != "deny" else 0) | int(phase != "disabled") | 0x8000
+                if actual["registers"][(6, ":")] != control & ~0x8000 or \
+                        event(f"control_{name}")["registers"][(5, "=")] != control:
+                    raise RuntimeError("privilege actual config operand/readback differs")
+                expected[relative(f"control_record_{name}"):relative(f"control_record_{name}") + 8] = struct.pack("<Q", control)
+            elif kind == "send":
+                slot = int(suffix[-1])
+                index = p * 4 + slot + (2 if phase == "allow" else 0)
+                value = values[index]
+                source = event(f"input_{name}")
+                address = syms[f"target_{p}"] + 64 + slot * width
+                wanted = [(p, value >> (i * 32) & 0xFFFFFFFF, address + 4 * i) for i in range(width // 4)]
+                delivery = [(int(q), int(v, 16), int(a, 16)) for q, v, a in re.findall(
+                    r"Writing MSG_PORT \(H0 p(\d+)\) data 0x([0-9a-f]+) to addr 0x\s*([0-9a-f]+)", "\n".join(actual["raw"]))]
+                if source["registers"][(6, "=")] != value or source["accesses"] != [(64, syms["input_payloads"] + index * 8, ":", value)] or \
+                        actual["registers"] != {(6, ":"): value, (7, ":"): 0x0100000800 + p * 64} or \
+                        actual["accesses"] != [(64, 0x0100000800 + p * 64, "=", value)] or delivery != wanted:
+                    raise RuntimeError("privilege sender/input/receiver raw evidence differs")
+                pos = relative(f"target_{p}") + 64 + slot * width
+                expected[pos:pos + width] = value.to_bytes(8, "little")[:width]
+            else:
+                pos = relative(f"record_{name}")
+                record = struct.unpack_from("<8Q", memory, pos)
+                seed, sentinel = 0x5AA55AA55AA55AA5, 0xA5A5A5A5A5A5A5A5
+                wanted = [seed, seed, sentinel, sentinel, sentinel, sentinel, sentinel, sentinel]
+                if event(f"before_{name}", mode)["registers"][(20, ":")] != seed or \
+                        event(f"after_{name}", "M" if kind == "ecall" else mode)["registers"][(20, ":")] != record[1]:
+                    raise RuntimeError("privilege before/after destination lacks real snapshot evidence")
+                if cause:
+                    states = [captures[k][fault_index]["registers"][(5, "=")] for k in ("cause", "epc", "tval", "status")]
+                    tval = 0 if kind == "ecall" else word
+                    if states[:3] != [cause, pc, tval] or (states[3] >> 11 & 3) != (0 if mode == "U" else 3) or \
+                            tuple(int(x, 16) for x in trap_logs[fault_index]) != (cause, tval) or (20, "=") in actual["registers"]:
+                        raise RuntimeError("privilege actual cause/epc/tval/MPP/destination disagrees")
+                    wanted[2:6] = states
+                    fault_index += 1
+                else:
+                    slot = None if suffix.endswith("empty") else 0 if suffix.endswith("_head") else 1
+                    returned = (1 << 64) - 1 if slot is None else slot * width
+                    if actual["registers"][(20, "=")] != returned:
+                        raise RuntimeError("privilege actual successful head return differs")
+                    wanted[1] = returned
+                    if slot is not None:
+                        value = values[p * 4 + slot + (2 if phase == "allow" else 0)] & ((1 << (width * 8)) - 1)
+                        address = syms[f"target_{p}"] + 64 + returned
+                        load = event(f"payload_{name}", mode)
+                        if load["registers"][(9, "=")] != value or load["registers"][(25, ":")] != address or \
+                                load["accesses"] != [(width * 8, address, ":", value)] or \
+                                (load["word"] & 127, load["word"] >> 12 & 7) != (3, 6 if width == 4 else 3):
+                            raise RuntimeError("privilege payload load lacks actual memory/unsigned encoding evidence")
+                        wanted[6:8] = [value, address]
+                if record != tuple(wanted) or snapshots[name]["actual"] != [hex(v) for v in record] or \
+                        pre[pos:pos + 128] != bytes([0xA5]) * 128:
+                    raise RuntimeError("privilege normalized snapshots disagree with raw execution")
+                expected[pos:pos + 64] = struct.pack("<8Q", *wanted)
+            verified.append(dict(name=name, mode=mode, pc=hex(pc), word=hex(word), cause=cause, cycle=actual["cycle"]))
+        event("park")
+        expected[relative("completion"):relative("completion") + 4] = struct.pack("<I", 0x4B4F5445)
+        if memory != expected:
+            raise RuntimeError("privilege entire reconstructed monitor/guards/completion differ")
+        runs.append(dict(run=run_name, case=case, instruction_count=92, csr_count=12, message_width=width,
+                         illegal_trap_count=32, user_ecall_count=12, successful_head_count=20, verified_operations=verified,
+                         sha256={name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in required}))
+    paths = ("csrs.h", "msgport.cpp", "processor.h", "memmap.h", "pma_et.cpp", "mmu.cpp", "emu_gio.h",
+             "insn_util.h", "insns/system.cpp", "insns/zicsr.cpp", "esrs_et.cpp", "processor.cpp")
+    report = dict(et_platform_commit=commit, scope="real M/U permissions on all four message ports; denied reads retain messages, enabled U reads, disabled M/U faults and U control privilege faults",
+                  verified_runs=runs, runs_missing_evidence=missing,
+                  limitations=["S-mode and U-mode blocking/wake unverified", "read-only CSR write side effects unverified", "nonzero OOB and 16/32-byte delivery engines unverified"],
+                  source_sha256={"sw-sysemu/" + name: hashlib.sha256((source_root / "sw-sysemu" / name).read_bytes()).hexdigest() for name in paths})
+    (ROOT / "out/isa/message-port-privilege-inventory.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report, missing
+
+
 def synchronization_peer_evidence(source_root: Path, commit: str) -> tuple[dict[str, object], list[str]]:
     """Audit both threads' FCC routes, restart/overflow and ordered FLB arrivals."""
     names = {"fcc", "fccnb", "flb"}
@@ -830,6 +1041,7 @@ def main() -> int:
     cache_report, missing_cache = cache_csr_evidence(source_root, commit)
     sync_report, missing_sync = synchronization_evidence(source_root, commit)
     port_report, missing_ports = message_port_evidence(source_root, commit)
+    privilege_report, missing_privilege = message_port_privilege_evidence(source_root, commit)
     peer_report, missing_peers = synchronization_peer_evidence(source_root, commit)
     print(f"ET Platform {commit}")
     print(f"decoded ET handler selectors: {len(operations)}")
@@ -842,6 +1054,7 @@ def main() -> int:
     print(f"separate cache CSR coverage: {cache_report['verified_csr_count']}/13; {ROOT / 'out/isa/cache-csr-inventory.json'}")
     print(f"separate synchronization CSR coverage: {sync_report['verified_csr_count']}/5; {ROOT / 'out/isa/synchronization-inventory.json'}")
     print(f"separate message-port CSR coverage: {port_report['verified_csr_count']}/12; {ROOT / 'out/isa/message-port-inventory.json'}")
+    print(f"message-port real M/U permission cases: {len(privilege_report['verified_runs'])}/2; {ROOT / 'out/isa/message-port-privilege-inventory.json'}")
     print(f"peer synchronization cases with audited T0/T1 routing/block/wake/overflow: {len(peer_report['verified_runs'])}/4; {ROOT / 'out/isa/synchronization-peer-inventory.json'}")
     if "--require-complete" in sys.argv and (missing_runs or document["unverified_nontrapping_handlers"] or
             missing_faults or document["verified_trap_stub_count"] != len(stubs)):
@@ -852,6 +1065,8 @@ def main() -> int:
         raise RuntimeError("incomplete synchronization execution evidence; inspect the separate synchronization inventory")
     if "--require-complete" in sys.argv and (missing_ports or port_report["missing_csrs"]):
         raise RuntimeError("incomplete message-port execution evidence; inspect the separate port inventory")
+    if "--require-complete" in sys.argv and missing_privilege:
+        raise RuntimeError("incomplete message-port M/U permission evidence; inspect the separate privilege inventory")
     if "--require-complete" in sys.argv and missing_peers:
         raise RuntimeError("incomplete peer synchronization execution evidence; inspect the separate peer inventory")
     return 0
