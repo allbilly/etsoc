@@ -1241,6 +1241,17 @@ Both real compressed cases and their independent audit passed. Their actual
 command `python3 examples/compressed.py`, observed results and zero exit are
 saved in `out/compressed-all-console.log` and its matching `.exit` file.
 The independent audit is `out/isa/compressed-inventory.log` with a zero `.exit` file.
+The expanded `python3 tools/compare.py --reuse` passed: 49 saved example
+execution sets were independently audited and the copied ADD-to-MUL ELF was
+freshly executed once. Its log and zero exit status are
+`out/compare/compressed-reuse-console.log` and the matching `.exit` file.
+The additional checkpoint audit passed across 49 ELF evidence sets, one fresh
+patched run, 496 artifact/upstream hashes and 23 Python syntax checks; its
+log/zero exit files are `out/isa/compressed-checkpoint-audit.log` and the
+matching `.exit` file. Current dedicated CPU coverage is 340/353 handlers,
+leaving 13. The current default driver requires 50 fresh device runs; that
+full fresh comparison remains outstanding. Saved-artifact mode does not claim
+50 newly executed programs.
 The earlier setup and integration evidence
 is retained; the full-platform integration test was not repeated for this
 extension.
@@ -1285,6 +1296,11 @@ Generated outputs are ignored by Git and remain in `out/`:
 - `out/isa/compressed-inventory.json`: all 34 selected handlers independently
   decoded and checked against actual register/MEM/control/trap events, plus
   complete guarded outputs and artifact/upstream source hashes.
+- `out/isa/compressed-completion-audit.json`: comparison audit of 49 saved
+  example executions plus one fresh patched run, 496 artifact/upstream hashes,
+  25 repository source hashes, executable-section dumps, complete guard/fault/
+  completion checks, and the independently verified single-byte ELF patch.
+  `out/isa/compressed-checkpoint-audit.py` reproduces this artifact audit.
 - `out/isa/branches-completion-audit.json`: comparison audit of 47 saved
   example executions plus one fresh patched run, 462 artifact/upstream hashes,
   24 repository source hashes, executable-section dumps, completion/guard
